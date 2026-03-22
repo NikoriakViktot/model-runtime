@@ -74,4 +74,5 @@ checkpoints/
 
 control_plane/.venv
 
+test-results/
 

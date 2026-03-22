@@ -29,6 +29,10 @@ import httpx
 import pytest
 import respx
 
+# All tests in this module are fault-injection resilience tests.
+# Mid-stream and truncated-stream tests also carry the streaming marker.
+pytestmark = pytest.mark.resilience
+
 from tests.resilience.conftest import (
     CHAT_REQUEST,
     MRM_URL,
@@ -169,6 +173,7 @@ async def test_mrm_timeout_returns_503(gateway_client):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.streaming
 async def test_gateway_survives_mid_stream_failure(gateway_client):
     """
     INVARIANT: when the upstream connection drops mid-stream (after some SSE
@@ -223,6 +228,7 @@ async def test_gateway_survives_mid_stream_failure(gateway_client):
     )
 
 
+@pytest.mark.streaming
 async def test_gateway_survives_truncated_stream_without_done(gateway_client):
     """
     INVARIANT: if vLLM closes the connection without sending ``data: [DONE]``,
@@ -264,6 +270,7 @@ async def test_gateway_survives_truncated_stream_without_done(gateway_client):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.streaming
 async def test_streaming_error_increments_error_metric(gateway_client):
     """
     INVARIANT: a mid-stream failure must be recorded as an error in the

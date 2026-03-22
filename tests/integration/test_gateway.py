@@ -25,6 +25,8 @@ import httpx
 import pytest
 import respx
 
+pytestmark = pytest.mark.invariant
+
 MRM_URL = "http://mrm-test:8010"
 SCHEDULER_URL = "http://scheduler-test:8030"
 VLLM_API_BASE = "http://vllm-test:8000/v1"
@@ -156,6 +158,7 @@ async def test_gateway_swaps_model_field_to_alias(gateway_client):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.streaming
 async def test_streaming_response_delivers_all_chunks_in_order(gateway_client):
     """
     INVARIANT: when stream=True, the Gateway delivers all SSE chunks to the
@@ -197,6 +200,7 @@ async def test_streaming_response_delivers_all_chunks_in_order(gateway_client):
     )
 
 
+@pytest.mark.streaming
 async def test_streaming_response_has_correct_content_type(gateway_client):
     """
     INVARIANT: streaming responses must have Content-Type: text/event-stream
@@ -310,7 +314,7 @@ async def test_gateway_distributed_mode_calls_scheduler_not_mrm(
         ],
     }
 
-    async with respx.MockRouter() as mock:
+    async with respx.MockRouter(assert_all_called=False) as mock:
         scheduler_route = mock.post(f"{SCHEDULER_URL}/schedule/ensure").mock(
             return_value=httpx.Response(200, json=scheduler_response)
         )

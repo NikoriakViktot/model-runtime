@@ -9,8 +9,8 @@ import streamlit as st
 from jinja2 import Template
 
 CP_URL = os.getenv("CONTROL_PLANE_URL", "http://control_plane:8004")
-DISPATCHER_URL = os.getenv("API_DISPATCHER_URL", "http://api_dispatcher:8005")
-S3_BUCKET = os.getenv("AWS_BUCKET_NAME", "epitaphs-work-dir")
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080")
+S3_BUCKET = os.getenv("AWS_BUCKET_NAME", "model-runtime-artifacts")
 MLFLOW_UI_URL = "/mlflow/"
 
 BASE_MODELS = [
@@ -52,6 +52,7 @@ BASE_MODELS = [
 
 st.set_page_config(page_title="AI Control Plane", layout="wide", page_icon="🧠")
 
+
 def init_session_state():
     defaults = {
         "selected_dataset_run_id": None,
@@ -61,7 +62,14 @@ def init_session_state():
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
+
 init_session_state()
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
 
 def _http_get(url: str, *, params: dict | None = None, timeout: int = 10) -> dict | list | None:
     try:
@@ -93,6 +101,11 @@ def _http_delete(url: str, *, timeout: int = 30) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Control Plane helpers
+# ---------------------------------------------------------------------------
+
+
 def cp_post_contract(contract_type: str, payload: dict) -> dict | None:
     envelope = {"type": contract_type, "spec_version": "v1", "payload": payload}
     return _http_post(f"{CP_URL}/contracts", json_body=envelope, timeout=10)
@@ -108,86 +121,31 @@ def cp_get_run(run_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def dispatcher_upload_db(file_bytes: bytes, filename: str) -> dict | None:
-    files = {"file": (filename, file_bytes, "application/octet-stream")}
-    return _http_post(f"{DISPATCHER_URL}/dispatch/exp/upload", files=files, timeout=60)
+# ---------------------------------------------------------------------------
+# Gateway helpers (inference)
+# ---------------------------------------------------------------------------
 
 
-def dispatcher_get_targets(db_id: str) -> list:
-    data = _http_get(f"{DISPATCHER_URL}/dispatch/etl/targets", params={"db_id": db_id}, timeout=10)
-    return data if isinstance(data, list) else []
+def gateway_chat(model: str, messages: list[dict], temperature: float, max_tokens: int) -> dict | None:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    return _http_post(f"{GATEWAY_URL}/v1/chat/completions", json_body=payload, timeout=120)
 
 
-def dispatcher_materialize(run_id: str):
-    return _http_post(
-        f"{DISPATCHER_URL}/dispatch/artifacts/materialize/{run_id}",
-        timeout=30,
-    )
+def gateway_list_models() -> list[dict]:
+    data = _http_get(f"{GATEWAY_URL}/v1/models", timeout=5)
+    if isinstance(data, dict):
+        return data.get("data", [])
+    return []
 
 
-def dispatcher_preview(run_id: str, limit: int = 5):
-    return _http_get(
-        f"{DISPATCHER_URL}/dispatch/preview",
-        params={"run_id": run_id, "limit": limit},
-        timeout=30,
-    )
-
-def select_dataset():
-    datasets = get_datasets_from_cp()
-    if not datasets:
-        st.info("No datasets available")
-        return None
-
-    selected = st.selectbox(
-        "Select dataset",
-        options=datasets,
-        format_func=lambda d: d["label"],
-        index=0,
-    )
-
-    if selected:
-        st.session_state.selected_dataset_run_id = selected["run_id"]
-        return selected
-
-    return None
-
-def render_dataset_preview(run_id: str):
-    st.warning("Preview uses local execution cache (dev-only)")
-
-    if st.button("Materialize + Preview"):
-        with st.spinner("Materializing dataset..."):
-            dispatcher_materialize(run_id)
-
-        with st.spinner("Loading preview..."):
-            data = dispatcher_preview(run_id, limit=5)
-
-        if not data:
-            st.error("Preview failed")
-            return
-
-        for i, sample in enumerate(data.get("samples", [])):
-            with st.expander(f"Sample #{i+1}"):
-                for msg in sample["messages"]:
-                    st.chat_message(msg["role"]).write(msg["content"])
-
-
-def dispatcher_delete_artifacts(run_id: str) -> bool:
-    return _http_delete(f"{DISPATCHER_URL}/dispatch/artifacts/{run_id}", timeout=30)
-
-
-def dispatcher_list_trained_models() -> list:
-    data = _http_get(f"{DISPATCHER_URL}/dispatch/models/trained", timeout=10)
-    return data if isinstance(data, list) else []
-
-
-def dispatcher_load_adapter(lora_name: str, lora_path: str) -> dict | None:
-    payload = {"lora_name": lora_name, "lora_path": lora_path}
-    return _http_post(f"{DISPATCHER_URL}/dispatch/deploy/load", json_body=payload, timeout=120)
-
-
-def dispatcher_chat(model: str, messages: list[dict], temperature: float, max_tokens: int) -> dict | None:
-    payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-    return _http_post(f"{DISPATCHER_URL}/dispatch/chat", json_body=payload, timeout=60)
+# ---------------------------------------------------------------------------
+# Dataset helpers (from Control Plane run history)
+# ---------------------------------------------------------------------------
 
 
 def get_datasets_from_cp() -> list[dict]:
@@ -225,6 +183,11 @@ def get_datasets_from_cp() -> list[dict]:
     return sorted(out, key=lambda x: x["run_id"], reverse=True)
 
 
+# ---------------------------------------------------------------------------
+# Prompt Studio
+# ---------------------------------------------------------------------------
+
+
 def render_prompt_studio() -> None:
     st.title("🎨 Prompt Engineering Studio")
     st.markdown("Model Behavior Management Center. Create, edit, and test prompts.")
@@ -234,9 +197,8 @@ def render_prompt_studio() -> None:
 
     with st.sidebar:
         st.header("Library")
-        new_pid = st.text_input("New Prompt ID (e.g. etl.gen_profile)")
+        new_pid = st.text_input("New Prompt ID (e.g. system.default)")
         if st.button("➕ Create New Family") and new_pid:
-            _http_post(f"{CP_URL}/prompts/", timeout=10)
             requests.post(f"{CP_URL}/prompts/", params={"id": new_pid, "description": "Created via UI"})
             st.rerun()
 
@@ -309,7 +271,7 @@ def render_prompt_studio() -> None:
         vars_found = sorted(set(re.findall(r"\{\{\s*(\w+)\s*\}\}", new_template)))
 
         if not vars_found:
-            st.info("There are no variables in the template. You can run the test immediately.")
+            st.info("No variables in template. You can run the test immediately.")
             return
 
         inputs: dict[str, str] = {}
@@ -326,83 +288,37 @@ def render_prompt_studio() -> None:
             except Exception as e:
                 st.error(f"Jinja2 Error: {e}")
 
-        if st.button("🚀 Run Inference (vLLM)"):
+        if st.button("🚀 Run Inference"):
             if "preview_prompt" not in st.session_state:
                 st.warning("First press -> 'Render Preview'")
                 return
 
             payload = {
-                "model": "qwen-base",
+                "model": BASE_MODELS[0],
                 "messages": [{"role": "user", "content": st.session_state["preview_prompt"]}],
                 "temperature": 0.7,
                 "max_tokens": 500,
             }
 
-            try:
-                r = requests.post("http://litellm:4000/chat/completions", json=payload, timeout=60)
-                if r.status_code == 200:
-                    st.success("Model Response:")
-                    st.write(r.json()["choices"][0]["message"]["content"])
-                else:
-                    st.error(f"LLM Error: {r.text}")
-            except Exception as e:
-                st.error(f"Connection Error: {e}")
+            res = gateway_chat(
+                payload["model"],
+                payload["messages"],
+                payload["temperature"],
+                payload["max_tokens"],
+            )
+            if res:
+                st.success("Model Response:")
+                st.write(res["choices"][0]["message"]["content"])
 
 
-def start_training(dataset):
-    st.divider()
-    st.subheader("Training")
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
 
-    base_model = st.selectbox("Base model", BASE_MODELS)
-    epochs = st.slider("Epochs", 1, 5, 1)
-    lr = st.select_slider(
-        "Learning rate",
-        options=[5e-6, 1e-5, 2e-5, 5e-5],
-        value=2e-5,
-    )
-
-    if st.button("Start training", type="primary"):
-        payload = {
-            "parent_run_id": dataset["run_id"],
-            "base_model": base_model,
-            "dataset": {"uri": dataset["uri"]},
-            "training": {
-                "epochs": epochs,
-                "learning_rate": lr,
-                "batch_size": 1,
-            },
-            "output": {
-                "lora_base_uri": f"s3://{S3_BUCKET}/loras"
-            },
-        }
-
-        res = cp_post_contract("train.qlora.v1", payload)
-
-        if not res:
-            st.error("Failed to submit training")
-            return
-
-        st.session_state.selected_training_run_id = res["run_id"]
-        st.success(f"Training run created: {res['run_id']}")
-
-def render_orchestration():
-    runs = cp_get_runs()
-    if not runs:
-        st.info("No runs")
-        return
-
-    df = pd.DataFrame(runs)
-    st.dataframe(
-        df[["id", "state", "type", "created_at"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-st.sidebar.title("🧬 Control Plane")
+st.sidebar.title("🧬 AI Runtime")
 page = st.sidebar.radio(
     "Navigation",
-    ["Orchestration", "Prompt Studio", "Datasets (ETL)", "Training", "Evaluation", "Deploy", "Chat"],
+    ["Orchestration", "Prompt Studio", "Datasets (ETL)", "Training", "Chat"],
 )
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"📊 **[Open MLflow UI]({MLFLOW_UI_URL})**", unsafe_allow_html=True)
@@ -415,15 +331,36 @@ if "last_run_id" not in st.session_state:
     st.session_state.last_run_id = None
 
 
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
 if page == "Orchestration":
     st.title("🎛️ Orchestration Dashboard")
     st.markdown("Monitor the state of the AI Kernel.")
+
+    c1, _ = st.columns([1, 5])
+    with c1:
+        if st.button("🔄 Refresh"):
+            st.rerun()
 
     runs = cp_get_runs()
     if runs:
         df = pd.DataFrame(runs)
         cols = [c for c in ["id", "state", "type", "created_at"] if c in df.columns]
         st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    st.subheader("🔎 Inspect Run")
+    run_id_input = st.text_input("Run ID")
+    if st.button("Load Run"):
+        if not run_id_input:
+            st.warning("Provide Run ID")
+        else:
+            data = cp_get_run(run_id_input)
+            if not data:
+                st.error("Run not found")
+            else:
+                st.json(data)
     else:
         st.info("No runs found.")
 
@@ -435,100 +372,43 @@ elif page == "Prompt Studio":
 elif page == "Datasets (ETL)":
     st.title("📦 Dataset Construction")
 
-    st.subheader("1. Source Data")
-    uploaded = st.file_uploader("Upload SQLite DB (.db)", type=["db"])
-    if uploaded:
-        with st.spinner("Uploading..."):
-            meta = dispatcher_upload_db(uploaded.getvalue(), uploaded.name)
-        if meta and meta.get("file_id"):
-            st.session_state.db_id = meta["file_id"]
-            st.success(f"Uploaded: {st.session_state.db_id}")
+    st.info(
+        "Dataset construction requires the **API Dispatcher** service. "
+        "Submit a `dataset.build.v1` contract directly via the Control Plane below, "
+        "or implement the API Dispatcher to enable full ETL functionality."
+    )
 
-    if st.session_state.db_id:
-        st.caption(f"DB ID: {st.session_state.db_id}")
-    else:
-        st.info("Please upload a database first.")
-        st.stop()
+    st.subheader("Submit dataset.build.v1 contract")
 
-    st.subheader("2. Configuration")
-    targets = dispatcher_get_targets(st.session_state.db_id)
-    if not targets:
-        st.warning("No targets found in DB.")
-        st.stop()
-
-    t_map = {f"{t['epitaph']} ({t['cnt']} rows)": t["epitaph"] for t in targets if "epitaph" in t and "cnt" in t}
-    sel = st.selectbox("Select Target Persona", list(t_map.keys()))
-    st.session_state.target_name = t_map[sel]
-
-    ds_type = st.radio("Dataset Type", ["graph", "sft", "prefs", "linear"], horizontal=True)
-    prompt_id = "etl.profile_generator"
-    prompt_ver = "latest"
-
-    if ds_type == "linear":
-        with st.expander("📝 Prompt Configuration", expanded=True):
-            prompt_id = st.text_input("Prompt Family ID", value="etl.profile_generator")
-            prompt_ver = st.text_input("Version Tag", value="latest")
-
-    with st.expander("Advanced Options"):
-        gen_rejected = st.checkbox("Generate Rejected Samples", value=(ds_type == "prefs"))
-        max_items = st.number_input("Max Items", 10, 10000, 500)
+    target_name = st.text_input("Target Name", placeholder="e.g. my-dataset-v1")
+    dataset_type = st.radio("Dataset Type", ["graph", "sft", "prefs", "linear"], horizontal=True)
+    max_items = st.number_input("Max Items", 10, 10000, 500)
 
     if st.button("🚀 Submit Build Contract"):
-        payload = {
-            "db_id": st.session_state.db_id,
-            "target_name": st.session_state.target_name,
-            "dataset_type": ds_type,
-            "options": {
-                "generate_rejected": gen_rejected,
-                "prompt_id": prompt_id,
-                "prompt_version": prompt_ver,
-                "rejected_max_items": max_items,
-            },
-            "output": {"base_uri": f"s3://{S3_BUCKET}/datasets"},
-        }
-
-        res = cp_post_contract("dataset.build.v1", payload)
-        if res and res.get("run_id"):
-            st.session_state.last_run_id = res["run_id"]
-            st.success(f"Run Created! ID: {res['run_id']}")
-            if "state" in res:
-                st.info(f"State: {res['state']}")
+        if not target_name:
+            st.warning("Target Name is required")
+        else:
+            payload = {
+                "target_name": target_name,
+                "dataset_type": dataset_type,
+                "options": {"max_items": max_items},
+                "output": {"base_uri": f"s3://{S3_BUCKET}/datasets"},
+            }
+            res = cp_post_contract("dataset.build.v1", payload)
+            if res and res.get("run_id"):
+                st.session_state.last_run_id = res["run_id"]
+                st.success(f"Run Created: {res['run_id']}")
 
     if st.session_state.last_run_id:
         st.divider()
-        st.subheader("👀 Build Progress & Preview")
-        run_id = st.session_state.last_run_id
-
+        st.subheader("Build Progress")
         if st.button("🔄 Check Status"):
-            run_data = cp_get_run(run_id)
-            if not run_data:
-                st.stop()
-
-            state = run_data.get("state", "UNKNOWN")
-            st.info(f"Current State: **{state}**")
-
-            if state in ("DATASET_READY", "DONE"):
+            run_data = cp_get_run(st.session_state.last_run_id)
+            if run_data:
+                st.info(f"State: **{run_data.get('state', 'UNKNOWN')}**")
                 artifacts = run_data.get("artifacts") or {}
-
-                if "stats" in artifacts:
-                    st.json(artifacts["stats"])
-
-                if "preview" in artifacts:
-                    st.markdown("### 🎲 Dataset Samples (Random 5)")
-
-                    for i, sample in enumerate(artifacts["preview"]):
-                        with st.expander(f"Sample #{i + 1}", expanded=False):
-                            for msg in sample.get("messages", []):
-                                role = msg.get("role")
-                                content = msg.get("content", "")
-                                if role == "system":
-                                    st.warning(f"**System**: {content[:300]}...")
-                                elif role in ("user", "assistant"):
-                                    st.chat_message(role).write(content)
-                            st.caption("Raw JSON:")
-                            st.code(json.dumps(sample, ensure_ascii=False), language="json")
-                else:
-                    st.warning("No preview data available in artifacts.")
+                if artifacts:
+                    st.json(artifacts)
 
 
 elif page == "Training":
@@ -536,99 +416,56 @@ elif page == "Training":
 
     c_refresh, _ = st.columns([1, 4])
     with c_refresh:
-        if st.button("🔄 Refresh List"):
+        if st.button("🔄 Refresh"):
             st.rerun()
 
     datasets_meta = get_datasets_from_cp()
+
     c1, c2 = st.columns(2)
 
     selected_ds = None
     with c1:
         if datasets_meta:
             selected_ds = st.selectbox(
-                "1. Select Target Dataset (from History)",
+                "1. Select Dataset",
                 options=datasets_meta,
                 format_func=lambda x: x["label"],
             )
-
             if selected_ds:
                 st.success(f"Selected: `{selected_ds['slug']}`")
                 st.caption(f"Run ID: `{selected_ds['run_id']}`")
-
-                with st.expander("👀 Preview Dataset Content", expanded=False):
-                    if st.button("Load Preview"):
-                        with st.spinner("Preparing dataset..."):
-                            dispatcher_materialize(selected_ds["run_id"])
-                            data = dispatcher_preview(selected_ds["run_id"], limit=3)
-
-                        st.caption(f"File: {data.get('file', '')}")
-                        for i, sample in enumerate(data.get("samples", [])):
-                            with st.expander(f"Sample #{i + 1}"):
-                                for msg in sample.get("messages", []):
-                                    role = msg.get("role", "user")
-                                    content = msg.get("content", "")
-                                    st.chat_message(role).write(content)
         else:
             st.warning("No built datasets found. Go to 'Datasets (ETL)' to build one.")
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("⬇️ Materialize Dataset"):
-            if not selected_ds:
-                st.warning("Select a dataset first")
-                st.stop()
-            if dispatcher_materialize(selected_ds["run_id"]):
-                st.success("Dataset cached locally")
-
-    with col_b:
-        if st.button("🗑️ Delete Local Artifacts"):
-            if not selected_ds:
-                st.warning("Select a dataset first")
-                st.stop()
-            if dispatcher_delete_artifacts(selected_ds["run_id"]):
-                st.success("Artifacts deleted")
-
     with c2:
-        default_idx = 3 if len(BASE_MODELS) > 3 else 0
-        base_model = st.selectbox("2. Base Model (Hugging Face)", BASE_MODELS, index=default_idx)
-
-        st.divider()
-        method = st.radio("Method", ["SFT (QLoRA)", "DPO", "SimPO"], horizontal=True)
-
+        base_model = st.selectbox("2. Base Model", BASE_MODELS, index=3)
         col_e, col_l = st.columns(2)
         epochs = col_e.slider("Epochs", 1, 10, 1)
         lr = col_l.select_slider("Learning Rate", options=[5e-6, 1e-5, 2e-5, 5e-5, 1e-4], value=2e-5)
 
     st.divider()
 
-    if st.button("Start training", type="primary"):
-        run_id = st.session_state.selected_dataset_run_id
-        if not run_id:
-            st.error("Select dataset first")
-            st.stop()
-
-        payload = {
-            "parent_run_id": run_id,
-            "base_model": base_model,
-            "training": {
-                "epochs": epochs,
-                "learning_rate": lr,
-                "batch_size": 1,
-            },
-            "output": {
-                "lora_base_uri": f"s3://{S3_BUCKET}/loras"
-            },
-        }
-
-        res = cp_post_contract("train.qlora.v1", payload)
-
-        if not res:
-            st.error("Training submission failed")
-            st.stop()
-
-        st.session_state.selected_training_run_id = res["run_id"]
-        st.success(f"Training started: {res['run_id']}")
-        st.info("Check 'Orchestration' tab for progress.")
+    if st.button("Start Training", type="primary"):
+        if not selected_ds:
+            st.error("Select a dataset first")
+        else:
+            payload = {
+                "parent_run_id": selected_ds["run_id"],
+                "base_model": base_model,
+                "training": {
+                    "epochs": epochs,
+                    "learning_rate": lr,
+                    "batch_size": 1,
+                },
+                "output": {
+                    "lora_base_uri": f"s3://{S3_BUCKET}/loras",
+                },
+            }
+            res = cp_post_contract("train.qlora.v1", payload)
+            if res:
+                st.session_state.selected_training_run_id = res.get("run_id")
+                st.success(f"Training started: {res.get('run_id')}")
+                st.info("Check 'Orchestration' tab for progress.")
 
 
 elif page == "Chat":
@@ -637,42 +474,19 @@ elif page == "Chat":
     with st.sidebar:
         st.subheader("Model Selection")
 
-        models_data = dispatcher_list_trained_models()
-        options = ["qwen-base"]
-        model_map = {"qwen-base": "qwen-base"}
-        paths_map: dict[str, str] = {}
+        # List live models from Gateway
+        live_models = gateway_list_models()
+        model_options = [m.get("id") for m in live_models if m.get("id")] or BASE_MODELS[:5]
 
-        for m in models_data:
-            metrics = m.get("metrics") or {}
-            loss = metrics.get("train_loss", "N/A")
-            if isinstance(loss, float):
-                loss = f"{loss:.3f}"
-
-            target_slug = m.get("target_slug", "unknown")
-            lora_name = m.get("lora_name")
-            lora_path = m.get("lora_path")
-
-            if not lora_name or not lora_path:
-                continue
-
-            display_name = f"🛡️ {target_slug} (Loss: {loss})"
-            options.append(display_name)
-            model_map[display_name] = lora_name
-            paths_map[lora_name] = lora_path
-
-        selected_display = st.selectbox("Choose Adapter", options)
-        selected_model_name = model_map[selected_display]
-
-        if selected_model_name != "qwen-base":
-            if st.button("🔌 Load Adapter to GPU"):
-                with st.spinner("Loading LoRA..."):
-                    res = dispatcher_load_adapter(selected_model_name, paths_map[selected_model_name])
-                    if res is not None:
-                        st.success(f"Loaded: {res.get('status', 'OK')}")
+        selected_model = st.selectbox("Model", model_options)
 
         st.subheader("Inference Params")
         temp = st.slider("Temperature", 0.0, 2.0, 0.7, step=0.1)
         max_tok = st.slider("Max Tokens", 64, 4096, 512, step=64)
+
+        if st.button("🗑️ Clear Chat"):
+            st.session_state.messages = []
+            st.rerun()
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -681,21 +495,22 @@ elif page == "Chat":
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    prompt = st.chat_input()
+    prompt = st.chat_input("Send a message...")
     if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
 
         with st.chat_message("assistant"):
-            res = dispatcher_chat(selected_model_name, st.session_state.messages, temp, max_tok)
+            res = gateway_chat(selected_model, st.session_state.messages, temp, max_tok)
             if not res:
+                st.error("Gateway returned no response.")
                 st.stop()
 
             try:
                 content = res["choices"][0]["message"]["content"]
-            except Exception:
-                st.error("Bad response shape from Dispatcher.")
+            except (KeyError, IndexError):
+                st.error(f"Unexpected response shape: {res}")
                 st.stop()
 
             st.write(content)

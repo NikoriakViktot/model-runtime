@@ -8,7 +8,7 @@ class DatasetOptions(BaseModel):
     generate_rejected: bool = True
     rejected_max_items: int = 500
 
-    prompt_id: Optional[str] = "etl.profile_generator"
+    prompt_id: Optional[str] = None
     prompt_version: Optional[str] = "latest"
 
 

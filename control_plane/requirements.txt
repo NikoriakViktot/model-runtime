@@ -6,5 +6,4 @@ psycopg2-binary
 pydantic
 redis
 alembic
-requests
 httpx>=0.28.1

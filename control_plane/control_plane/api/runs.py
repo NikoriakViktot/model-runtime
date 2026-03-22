@@ -1,13 +1,13 @@
 from sqlalchemy.orm import Session
 from uuid import UUID
-from typing import Optional, List, Any, Dict
+from typing import Optional, Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import or_
 
 from control_plane.infrastructure.db.session import get_db
 from control_plane.infrastructure.db.models import Run
 
 router = APIRouter()
+
 
 def _run_to_dict(r: Run) -> Dict[str, Any]:
     return {
@@ -27,63 +27,27 @@ def get_run(run_id: UUID, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Run not found")
     return _run_to_dict(run)
 
+
 @router.get("/runs")
-def list_runs_basic(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    runs = (
-        db.query(Run)
-        .order_by(Run.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-        .all()
-    )
-    return [
-        {
-            "id": str(r.id),
-            "state": r.state,
-            "type": (r.contract or {}).get("type"),
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in runs
-    ]
-
-
-
-
-@router.get("/runs-filter")
-def runs_filter(
+def list_runs(
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db),
     run_type: Optional[str] = Query(None),
     base_model: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     exclude_status: Optional[str] = Query(None),
-    epitaph_id: Optional[UUID] = Query(None),
+    db: Session = Depends(get_db),
 ):
     q = db.query(Run)
 
     if status:
         q = q.filter(Run.state == status)
-
     if exclude_status:
         q = q.filter(Run.state != exclude_status)
-
     if run_type:
         q = q.filter(Run.contract["type"].astext == run_type)
-
     if base_model:
         q = q.filter(Run.contract["payload"]["base_model"].astext == base_model)
 
-    if epitaph_id:
-        q = q.filter(
-            Run.contract["payload"]["epitaph_id"].astext == str(epitaph_id)
-        )
-
-    runs = (
-        q.order_by(Run.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-        .all()
-    )
-
+    runs = q.order_by(Run.created_at.desc()).offset(skip).limit(limit).all()
     return [_run_to_dict(r) for r in runs]

@@ -28,7 +28,6 @@ class TrainQLoRAPayloadV1(BaseModel):
     Payload for 'train.qlora.v1' contract.
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
-    epitaph_id: str
     parent_run_id: str
     target_slug: str
     base_model: str

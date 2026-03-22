@@ -156,12 +156,210 @@ jobs:
             --timeout=60
 
   # =========================================================================
+  # Flaky detection — run resilience tests 3× and flag inconsistent results.
+  # Runs in parallel with chaos after unit+integration complete.
+  # =========================================================================
+  flaky:
+    name: Flaky Detection
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r gateway/requirements.txt
+          pip install -r scheduler/requirements.txt
+          pip install -r node_agent/requirements.txt
+          pip install -r tests/requirements.txt
+
+      - name: Run resilience tests — round 1
+        run: |
+          pytest tests/resilience/ -v \
+            --tb=short \
+            -m "resilience and not slow" \
+            --timeout=30 \
+            --junitxml=test-results/flaky-run1.xml
+        continue-on-error: true
+
+      - name: Run resilience tests — round 2
+        run: |
+          pytest tests/resilience/ -v \
+            --tb=short \
+            -m "resilience and not slow" \
+            --timeout=30 \
+            --junitxml=test-results/flaky-run2.xml
+        continue-on-error: true
+
+      - name: Run resilience tests — round 3
+        run: |
+          pytest tests/resilience/ -v \
+            --tb=short \
+            -m "resilience and not slow" \
+            --timeout=30 \
+            --junitxml=test-results/flaky-run3.xml
+        continue-on-error: true
+
+      - name: Check for flaky tests
+        run: |
+          python scripts/check_flaky.py \
+            test-results/flaky-run1.xml \
+            test-results/flaky-run2.xml \
+            test-results/flaky-run3.xml
+
+      - name: Upload flaky run results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flaky-results
+          path: test-results/flaky-run*.xml
+
+  # =========================================================================
+  # Chaos tests — probabilistic failures, node churn, mixed workloads.
+  # Runs in parallel with flaky after unit+integration complete.
+  # =========================================================================
+  chaos:
+    name: Chaos Tests
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r gateway/requirements.txt
+          pip install -r scheduler/requirements.txt
+          pip install -r node_agent/requirements.txt
+          pip install -r tests/requirements.txt
+
+      - name: Run chaos tests
+        run: |
+          pytest tests/chaos/ -v \
+            --tb=short \
+            -m "chaos and not slow" \
+            --timeout=30 \
+            --junitxml=test-results/chaos.xml
+
+      - name: Upload chaos results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-results
+          path: test-results/chaos.xml
+
+  # =========================================================================
+  # Resilience tests — full suite including slow tests.
+  # Runs in parallel with flaky + chaos.
+  # =========================================================================
+  resilience:
+    name: Resilience Tests
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install service dependencies
+        run: |
+          pip install -r gateway/requirements.txt
+          pip install -r scheduler/requirements.txt
+          pip install -r node_agent/requirements.txt
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run resilience tests
+        run: |
+          pytest tests/resilience/ -v \
+            --tb=short \
+            -m "not system" \
+            --timeout=60 \
+            --junitxml=test-results/resilience.xml
+
+      - name: Upload resilience results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resilience-results
+          path: test-results/resilience.xml
+
+  # =========================================================================
+  # CI Report — collect all artifacts and produce a structured summary.
+  # Runs after resilience + flaky + chaos; gates the system tests.
+  # =========================================================================
+  report:
+    name: CI Report
+    runs-on: ubuntu-latest
+    needs: [resilience, flaky, chaos]
+    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download resilience results
+        uses: actions/download-artifact@v4
+        with:
+          name: resilience-results
+          path: test-results/
+        continue-on-error: true
+
+      - name: Download chaos results
+        uses: actions/download-artifact@v4
+        with:
+          name: chaos-results
+          path: test-results/
+        continue-on-error: true
+
+      - name: Generate summary
+        run: |
+          python scripts/collect_ci_metrics.py \
+            --resilience test-results/resilience.xml \
+            --chaos      test-results/chaos.xml \
+            --output     test-results/summary.json
+
+      - name: Upload CI summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-summary
+          path: test-results/summary.json
+
+      - name: Print summary to job log
+        run: cat test-results/summary.json
+
+  # =========================================================================
   # System tests (optional — runs only on main branch or manual trigger)
   # =========================================================================
   system:
     name: System Tests
     runs-on: ubuntu-latest
-    needs: [unit, integration, resilience]
+    needs: [report, flaky]
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
 
     steps:

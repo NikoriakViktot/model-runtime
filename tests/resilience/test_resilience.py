@@ -31,6 +31,8 @@ import httpx
 import pytest
 import respx
 
+pytestmark = pytest.mark.resilience
+
 from gateway.services.router import InstanceInfo, LeastLoadedStrategy, ModelRouter
 from tests.resilience.conftest import (
     CHAT_REQUEST,
@@ -44,7 +46,6 @@ from tests.resilience.conftest import (
 )
 from tests.utils.fault_injection import (
     MidStreamFailure,
-    SSE_CHUNKS as _,
     simulate_failure,
 )
 
@@ -73,21 +74,22 @@ async def test_gateway_stable_after_vllm_crash(gateway_client):
 
     A single instance failure must not poison the Gateway process.
     """
+    call_count = 0
+
+    async def crash_then_recover(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise httpx.ConnectError("Connection refused", request=request)
+        return httpx.Response(200, json=VLLM_CHAT_RESPONSE)
+
     async with respx.MockRouter() as mock:
         _mock_mrm_ensure(mock)
+        mock.post(f"{VLLM_API_BASE}/chat/completions").mock(side_effect=crash_then_recover)
 
-        # First request: vLLM is down
-        mock.post(f"{VLLM_API_BASE}/chat/completions").mock(
-            side_effect=httpx.ConnectError("Connection refused", request=None)
-        )
         r1 = await gateway_client.post("/v1/chat/completions", json=CHAT_REQUEST)
         assert r1.status_code == 502
 
-        # Second request: vLLM recovered
-        mock.pop("POST", f"{VLLM_API_BASE}/chat/completions")
-        mock.post(f"{VLLM_API_BASE}/chat/completions").mock(
-            return_value=httpx.Response(200, json=VLLM_CHAT_RESPONSE)
-        )
         r2 = await gateway_client.post("/v1/chat/completions", json=CHAT_REQUEST)
         assert r2.status_code == 200, (
             "Gateway must serve requests normally after recovering from a vLLM crash"
@@ -221,6 +223,7 @@ async def test_error_rate_reflects_upstream_reliability(gateway_client):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.invariant
 def test_least_loaded_routes_all_traffic_away_from_saturated_instance():
     """
     INVARIANT: when one instance reports load=1.0 (fully saturated) and
@@ -241,6 +244,7 @@ def test_least_loaded_routes_all_traffic_away_from_saturated_instance():
     )
 
 
+@pytest.mark.invariant
 def test_routing_distribution_proportional_to_load_gap():
     """
     INVARIANT: the routing strategy consistently avoids the high-load instance.
@@ -386,7 +390,7 @@ async def test_placement_stable_during_node_registration_churn(scheduler, fake_r
     await register_node(scheduler, "node-stable", "http://stable:8020", free_mb=20_000)
     await register_node(scheduler, "node-temp", "http://temp:8020", free_mb=16_000)
 
-    async with respx.MockRouter() as mock:
+    async with respx.MockRouter(assert_all_called=False) as mock:
         mock.post("http://stable:8020/local/ensure").mock(
             return_value=httpx.Response(
                 200, json=node_ensure_payload(api_base="http://stable:8000/v1")

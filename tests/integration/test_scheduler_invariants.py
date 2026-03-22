@@ -24,6 +24,8 @@ import httpx
 import pytest
 import respx
 
+pytestmark = pytest.mark.invariant
+
 from tests.integration.conftest import node_agent_ensure_payload, register_node
 
 NODE_1_URL = "http://node-1:8020"
@@ -52,11 +54,10 @@ async def test_ensure_is_idempotent(scheduler):
         )
 
         results = [await scheduler.ensure(MODEL) for _ in range(5)]
+        node_agent_calls = mock.calls.call_count
 
     api_bases = {r.api_base for r in results}
     assert len(api_bases) == 1, "All ensure calls must return the same api_base"
-
-    node_agent_calls = mock.calls.call_count
     assert node_agent_calls == 1, (
         f"Node Agent must be called exactly once (cold start); got {node_agent_calls}"
     )

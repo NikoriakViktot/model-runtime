@@ -30,6 +30,8 @@ import httpx
 import pytest
 import respx
 
+pytestmark = pytest.mark.concurrency
+
 from tests.resilience.conftest import (
     CHAT_REQUEST,
     MRM_URL,
@@ -106,6 +108,7 @@ async def test_100_concurrent_ensures_produce_single_placement(scheduler, fake_r
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 async def test_200_concurrent_ensures_produce_single_placement(scheduler, fake_redis):
     """
     INVARIANT: the per-model lock must hold under extreme concurrency.
@@ -293,6 +296,7 @@ async def test_multi_model_concurrency_produces_independent_placements(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 async def test_ensure_latency_profile_under_moderate_load(scheduler):
     """
     INVARIANT: ensure() latency must not degrade severely under 50 concurrent
@@ -338,6 +342,7 @@ async def test_ensure_latency_profile_under_moderate_load(scheduler):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 async def test_ensure_completes_within_deadline_under_concurrency(scheduler):
     """
     INVARIANT: ensure() must never deadlock.  Under any concurrency level,

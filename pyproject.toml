@@ -3,6 +3,12 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "system: marks tests that require a running docker-compose stack (deselect with '-m not system')",
+    "invariant: core correctness invariants — idempotency, isolation, routing, no-500s",
+    "resilience: fault injection and recovery tests — timeouts, errors, partial failures",
+    "streaming: SSE / streaming response tests",
+    "concurrency: concurrent-load tests — thundering herd, isolation, deadlock detection",
+    "slow: tests that take >5s by design (skip in fast feedback loops with '-m not slow')",
+    "chaos: chaos engineering tests — probabilistic failures, mixed workloads",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

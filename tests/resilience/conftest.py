@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 import fakeredis
 import httpx
+from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 
 from scheduler.models import GpuInfo, HeartbeatPayload
@@ -91,6 +92,19 @@ async def scheduler(fake_redis):
 
 
 # ---------------------------------------------------------------------------
+# Reset gateway model_router metrics between tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def reset_model_router_metrics():
+    """Reset ModelRouter metrics before each test to prevent cross-test pollution."""
+    from gateway.services.router import model_router
+    model_router.reset_metrics()
+    yield
+
+
+# ---------------------------------------------------------------------------
 # Gateway ASGI client
 # ---------------------------------------------------------------------------
 
@@ -105,8 +119,11 @@ async def gateway_client(monkeypatch):
 
     from gateway.main import app
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client
+    async with LifespanManager(app, startup_timeout=10, shutdown_timeout=5) as manager:
+        async with AsyncClient(
+            transport=ASGITransport(app=manager.app), base_url="http://test"
+        ) as client:
+            yield client
 
 
 # ---------------------------------------------------------------------------

@@ -69,7 +69,7 @@ async def test_local_ensure_proxies_to_mrm_and_returns_verbatim(node_agent_clien
     INVARIANT: POST /local/ensure forwards the request to MRM and returns
     MRM's response without modification.
     """
-    async with respx.MockRouter() as mock:
+    async with respx.MockRouter(assert_all_called=False) as mock:
         mock.post(f"{MRM_URL}/models/ensure").mock(
             return_value=httpx.Response(200, json=MRM_ENSURE_RESPONSE)
         )

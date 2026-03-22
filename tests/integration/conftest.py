@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import fakeredis
 import httpx
+from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 
 from scheduler.models import GpuInfo, HeartbeatPayload
@@ -107,11 +108,14 @@ def node_agent_ensure_payload(
 @pytest.fixture
 async def node_agent_client(monkeypatch):
     """
-    Node Agent served via ASGI transport.
+    Node Agent served via ASGI transport with lifespan triggered.
 
-    Settings are patched on the already-instantiated settings singleton
-    BEFORE the lifespan runs, so mrm_client.setup() picks up the test URL.
-    The heartbeat interval is set to 1 hour to prevent spurious background calls.
+    Settings are patched BEFORE the lifespan runs so that local_mrm.setup()
+    and send_heartbeat() use the test URLs.  The heartbeat interval is set to
+    1 hour to prevent background loops from firing during tests.
+
+    The initial heartbeat in lifespan will fail (no scheduler running) but
+    that error is caught and logged — it does not abort startup.
     """
     from node_agent.config import settings as agent_settings
 
@@ -123,8 +127,11 @@ async def node_agent_client(monkeypatch):
 
     from node_agent.app import app
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client
+    async with LifespanManager(app, startup_timeout=10, shutdown_timeout=5) as manager:
+        async with AsyncClient(
+            transport=ASGITransport(app=manager.app), base_url="http://test"
+        ) as client:
+            yield client
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +155,11 @@ async def gateway_client(monkeypatch):
 
     from gateway.main import app
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client
+    async with LifespanManager(app, startup_timeout=10, shutdown_timeout=5) as manager:
+        async with AsyncClient(
+            transport=ASGITransport(app=manager.app), base_url="http://test"
+        ) as client:
+            yield client
 
 
 @pytest.fixture
@@ -165,5 +175,8 @@ async def gateway_client_with_scheduler(monkeypatch):
 
     from gateway.main import app
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        yield client
+    async with LifespanManager(app, startup_timeout=10, shutdown_timeout=5) as manager:
+        async with AsyncClient(
+            transport=ASGITransport(app=manager.app), base_url="http://test"
+        ) as client:
+            yield client

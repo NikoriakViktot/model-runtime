@@ -1,66 +1,48 @@
-#infrastructure/dispatcher.py
-
 import os
-import requests
+import logging
+import httpx
 from uuid import UUID
 
-# This points to the Dispatcher Microservice (ex-ETL service API)
-DISPATCHER_URL = os.getenv("API_DISPATCHER_URL", "http://api_dispatcher:8005")
-# infrastructure/dispatcher.py
+logger = logging.getLogger(__name__)
 
-def dispatch(
+DISPATCHER_URL = os.getenv("API_DISPATCHER_URL", "http://api_dispatcher:8005")
+
+_ENDPOINTS = {
+    "DATASET_BUILD": "/etl/build",
+    "TRAIN": "/dispatch/train/start",
+    "EVAL": "/eval/run",
+}
+
+
+async def dispatch(
     action: str,
     run_id: UUID,
     *,
     contract_payload: dict | None = None,
     artifacts: dict | None = None,
 ):
-    timeout = 10
+    endpoint = _ENDPOINTS.get(action)
+    if endpoint is None:
+        logger.warning("Unknown dispatch action: %s", action)
+        return
 
-    if action in ("TRAIN", "DATASET_BUILD", "EVAL"):
-        if not contract_payload:
-            raise ValueError(f"{action} requires contract_payload")
+    if not contract_payload:
+        raise ValueError(f"{action} requires contract_payload")
 
-        payload = {
-            "run_id": str(run_id),
-            **contract_payload,
-            **(artifacts or {}),
-        }
+    payload = {
+        "run_id": str(run_id),
+        **contract_payload,
+        **(artifacts or {}),
+    }
 
     try:
-        if action == "DATASET_BUILD":
-            requests.post(
-                f"{DISPATCHER_URL}/etl/build",
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{DISPATCHER_URL}{endpoint}",
                 json=payload,
-                timeout=timeout,
-            ).raise_for_status()
-            return
-
-        if action == "TRAIN":
-            requests.post(
-                f"{DISPATCHER_URL}/dispatch/train/start",
-                json=payload,
-                timeout=timeout,
-            ).raise_for_status()
-            return
-
-        if action == "EVAL":
-            requests.post(
-                f"{DISPATCHER_URL}/eval/run",
-                json=payload,
-                timeout=timeout,
-            ).raise_for_status()
-            return
-
-        if action == "NOTIFY":
-            requests.post(
-                f"{DISPATCHER_URL}/notify",
-                json=artifacts or {},
-                timeout=5,
-            ).raise_for_status()
-            return
-
-        print(f"⚠️ [Dispatcher] Unknown action: {action}")
-
+                timeout=10,
+            )
+            resp.raise_for_status()
     except Exception as e:
-        print(f"❌ [Dispatcher] Failed to dispatch {action} for run {run_id}: {e}")
+        logger.error("Dispatch %s failed for run %s: %s", action, run_id, e)
+        raise

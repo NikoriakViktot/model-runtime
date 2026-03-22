@@ -1,20 +1,3 @@
-## 1. Positioning
-
-```text
-Universal runtime for AI models — from download to inference in one command.
-```
-
-Альтернатива:
-
-```text
-Run any AI model locally or on GPU without infrastructure overhead.
-```
-
----
-
-## 2. README (готовий)
-
-````markdown
 # llm-runtime
 
 Universal runtime for AI models — from download to inference in one command.

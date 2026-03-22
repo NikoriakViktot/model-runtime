@@ -1,0 +1,10 @@
+[server]
+port = 8502
+address = "0.0.0.0"
+baseUrlPath = "ui"
+enableCORS = false
+enableXsrfProtection = false
+headless = true
+
+[browser]
+gatherUsageStats = false

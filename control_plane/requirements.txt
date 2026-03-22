@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+sqlalchemy>=2.0
+asyncpg
+psycopg2-binary
+pydantic
+redis
+alembic
+requests
+httpx>=0.28.1

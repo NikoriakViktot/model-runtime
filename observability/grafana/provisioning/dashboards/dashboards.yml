@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: "AI Inference Dashboards"
+    orgId: 1
+    folder: "AI Inference"
+    folderUid: "ai-inference"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards

@@ -1,0 +1,398 @@
+version: "3.9"
+
+networks:
+  ai_net:
+    name: ai_net
+    driver: bridge
+
+
+volumes:
+  postgres_data:
+
+services:
+  # ===============================
+  # INFRA
+  # ===============================
+#  redis:
+#    image: redis:7
+#    container_name: dev_redis
+#    networks: [ai_net]
+
+  db:
+    image: postgres:16
+    container_name: dev_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    networks: [ ai_net ]
+
+
+
+  # ===============================
+  # MLFLOW
+  # ===============================
+  mlflow:
+    build: ./mlflow
+    container_name: dev_mlflow
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --static-prefix /mlflow
+      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_MLFLOW_DB}
+      --default-artifact-root /app/artifacts/mlflow
+    depends_on:
+      - db
+    networks: [ai_net]
+
+  # ===============================
+  # LLM BACKEND (GPU, SAME AS PROD)
+  # ===============================
+  model_runtime_manager:
+    build: ../../model-runtime/model_runtime_manager
+    runtime: nvidia
+    container_name: dev_mrm
+    command: uvicorn mrm.app:app --host 0.0.0.0 --port 8010
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8010/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./artifacts:/artifacts
+      - ./hf_cache:/app_host/hf_cache
+      - ./shared:/shared
+    environment:
+      MRM_REDIS_URL: redis://epitaphs_redis:6379/2
+      MRM_DOCKER_NETWORK: ai_net
+      MRM_IDLE_TIMEOUT_SEC: "900"
+      MRM_SWEEP_INTERVAL_SEC: "30"
+      MRM_HEALTH_TIMEOUT_SEC: "600"
+      MRM_KEEP_FAILED_CONTAINERS: "1"
+      MRM_LITELLM_CONFIG_PATH: /shared/litellm.generated.yaml
+      MRM_LITELLM_CONTAINER_NAME: dev_litellm
+      MRM_LITELLM_AUTOWRITE: "1"
+      MRM_LITELLM_RESTART_ON_WRITE: "1"
+      MRM_LORA_ROOT_HOST_PATH: ${PWD}/artifacts/adapters
+      MRM_ARTIFACTS_HOST_PATH: ${PWD}/artifacts
+      MRM_HF_CACHE_HOST_PATH: ${PWD}/hf_cache
+      HF_TOKEN: ${HF_TOKEN}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+      MRM_HF_TOKEN: ${HF_TOKEN}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    networks:
+      - ai_net
+      - source_db_net
+
+
+
+#  vllm:
+#    image: vllm/vllm-openai:latest
+#    container_name: dev_vllm
+#    runtime: nvidia
+#    ipc: host
+#    shm_size: "8gb"
+#    environment:
+#      NVIDIA_VISIBLE_DEVICES: "0"
+#      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+#      VLLM_TARGET_DEVICE: cuda
+#      VLLM_USE_V1: "0"
+#      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+#      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+#      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+#    volumes:
+#      - ./artifacts:/app/artifacts
+#      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+#    command: >
+#      Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
+#      --served-model-name qwen-base
+#      --enable-lora
+#      --max-loras 2
+#      --max-lora-rank 32
+#      --gpu-memory-utilization 0.60
+#      --max-model-len 2048
+#      --enforce-eager
+#      --host 0.0.0.0
+#      --port 8000
+#    healthcheck:
+#      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+#      interval: 30s
+#      timeout: 5s
+#      retries: 5
+#    networks: [ai_net]
+
+  # ===============================
+  # EMBEDDINGS API
+  # ===============================
+
+  embeddings_api:
+    image: michaelf34/infinity:latest
+    container_name: ai_embeddings
+    command: v2 --model-id sentence-transformers/all-MiniLM-L6-v2 --port 7997 --batch-size 32
+    ports:
+      - "7997:7997"
+    volumes:
+      - ./hf_cache:/app/.cache
+    networks: [ ai_net ]
+    environment:
+     - NVIDIA_VISIBLE_DEVICES=0
+
+  # ===============================
+  # LITELLM
+  # ===============================
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:main-stable
+    container_name: dev_litellm
+    volumes:
+      - ./shared:/shared:ro
+    command: [ "--config", "/shared/litellm.generated.yaml", "--port", "4000", "--detailed_debug" ]
+    networks: [ ai_net ]
+
+  # ===============================
+  # CONTROL PLANE
+  # ===============================
+  control_plane:
+    build: ../../model-runtime/control_plane
+    container_name: ai_control_plane
+    command: uvicorn control_plane.main:app --host 0.0.0.0 --port 8004
+    environment:
+      DATABASE_URL: postgresql+psycopg2://user:password@db:5432/epitaphs
+      REDIS_URL: redis://epitaphs_redis:6379/0
+      API_DISPATCHER_URL: http://api_dispatcher:8005
+      LOG_LEVEL: DEBUG
+    depends_on:
+      - db
+    networks:
+      - ai_net
+
+
+  # ===============================
+  # API DISPATCHER
+  # ===============================
+  api_dispatcher:
+    build: ./etl_service
+    container_name: ai_api_brain
+    command: uvicorn etl_service.api.main_api:app --host 0.0.0.0 --port 8005 --reload
+    env_file: ./.env
+    environment:
+      ARTIFACTS_DIR: "/artifacts"
+      DATABASE_URL: postgresql+psycopg2://user:password@db:5432/epitaphs
+      SOURCE_DATABASE_URL: postgresql://postgres:yourpassword@epitaphs_db_ai:5432/epitaphs_dev
+      CELERY_BROKER_URL: redis://epitaphs_redis:6379/0
+      CELERY_RESULT_BACKEND: redis://epitaphs_redis:6379/1
+      CONTROL_PLANE_URL: http://control_plane:8004
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_BUCKET_NAME: ${AWS_S3_BUCKET}
+      X_API_KEY: ${X_API_KEY}
+      NODE_TRAINING_CALLBACK_URL: "http://epitaphs_api_ai:8000/api/v1/epitaphs/callbacks/v2_training_pipeline"
+      V1_INFERENCE_CALLBACK_URL: "http://epitaphs_api_ai:8000/api/api/v1/generate/{epitaph_id}"
+      https://1cc86eabe170:ngrok-free:app:
+      EMBEDDING_API_BASE: "http://embeddings_api:7997"
+    volumes:
+      - ./artifacts:/artifacts
+
+    networks:
+      - ai_net
+
+
+  # ===============================
+  # FRONTEND
+  # ===============================
+  frontend:
+    build: ../../model-runtime/frontend
+    container_name: dev_frontend
+    command: streamlit run app_2.py --server.port=8502 --server.address=0.0.0.0 --server.baseUrlPath=/ui
+    env_file: ./.env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      SOURCE_DATABASE_URL: postgresql://postgres:yourpassword@epitaphs_db_ai:5432/epitaphs_dev
+      CONTROL_PLANE_URL: http://control_plane:8004
+      API_DISPATCHER_URL: http://api_dispatcher:8005
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+      AWS_BUCKET_NAME: ${AWS_S3_BUCKET}
+    volumes:
+      - ./frontend:/app
+      - ./artifacts:/artifacts
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fsS http://localhost:8502/ui/_stcore/health || exit 1" ]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    networks: [ai_net]
+
+  # ===============================
+  # DISTRIBUTED INFERENCE SCHEDULER
+  # ===============================
+  scheduler:
+    build: ../../model-runtime/scheduler
+    container_name: dev_scheduler
+    command: uvicorn scheduler.app:app --host 0.0.0.0 --port 8030
+    ports:
+      - "8030:8030"
+    environment:
+      SCHEDULER_REDIS_URL: redis://epitaphs_redis:6379/3
+      SCHEDULER_PLACEMENT_STRATEGY: least_loaded
+      SCHEDULER_NODE_TTL_SEC: "60"
+      SCHEDULER_OTEL_ENDPOINT: "http://jaeger:4317"
+      SCHEDULER_OTEL_SERVICE_NAME: "scheduler"
+      LOG_FORMAT: "json"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8030/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [ ai_net ]
+
+  # ===============================
+  # NODE AGENT (one per GPU server)
+  # ===============================
+  node_agent:
+    build: ../../model-runtime/node_agent
+    container_name: dev_node_agent
+    command: uvicorn node_agent.app:app --host 0.0.0.0 --port 8020
+    environment:
+      NODE_AGENT_NODE_ID: dev-node-01
+      NODE_AGENT_AGENT_URL: http://node_agent:8020
+      NODE_AGENT_SCHEDULER_URL: http://scheduler:8030
+      NODE_AGENT_MRM_URL: http://model_runtime_manager:8010
+      NODE_AGENT_HEARTBEAT_INTERVAL_SEC: "15"
+      NODE_AGENT_OTEL_ENDPOINT: "http://jaeger:4317"
+      NODE_AGENT_OTEL_SERVICE_NAME: "node-agent"
+      LOG_FORMAT: "json"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    runtime: nvidia
+    depends_on:
+      model_runtime_manager:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8020/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [ ai_net ]
+
+  # ===============================
+  # AI RUNTIME GATEWAY
+  # ===============================
+  gateway:
+    build: ../../model-runtime/gateway
+    container_name: dev_gateway
+    command: uvicorn gateway.main:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_MRM_URL: http://model_runtime_manager:8010
+      GATEWAY_EMBEDDINGS_URL: http://embeddings_api:7997
+      GATEWAY_MLFLOW_TRACKING_URI: http://mlflow:5000
+      GATEWAY_MLFLOW_ENABLED: "true"
+      GATEWAY_AUTO_PROVISION: "false"
+      # Set to "true" to enable distributed mode via Scheduler.
+      # Leave "false" for single-node operation (default).
+      GATEWAY_USE_SCHEDULER: "false"
+      GATEWAY_SCHEDULER_URL: http://scheduler:8030
+      GATEWAY_OTEL_ENDPOINT: "http://jaeger:4317"
+      GATEWAY_OTEL_SERVICE_NAME: "gateway"
+      LOG_FORMAT: "json"
+    depends_on:
+      model_runtime_manager:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [ ai_net ]
+
+  # ===============================
+  # OBSERVABILITY STACK
+  # ===============================
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: dev_prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ../../model-runtime/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks: [ai_net]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: dev_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "http://localhost:3000"
+    volumes:
+      - ../../model-runtime/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../model-runtime/observability/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    networks: [ai_net]
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: dev_jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP/gRPC receiver
+      - "4318:4318"     # OTLP/HTTP receiver
+    networks: [ai_net]
+    restart: unless-stopped
+
+  # ===============================
+  # GATEWAY
+  # ===============================
+  nginx:
+    image: nginx:latest
+    container_name: dev_nginx
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - control_plane
+      - frontend
+      - api_dispatcher
+      - mlflow
+      - litellm
+      - model_runtime_manager
+    networks: [ai_net]

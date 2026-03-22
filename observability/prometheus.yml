@@ -1,0 +1,60 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "ai-inference"
+
+# Alertmanager configuration (optional — uncomment to enable)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # -----------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # -----------------------------------------------------------------------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # -----------------------------------------------------------------------
+  # AI Runtime Gateway
+  # Exposes: gateway_requests_total, gateway_request_latency_seconds,
+  #          gateway_in_flight_requests, gateway_errors_total,
+  #          gateway_routing_decisions_total
+  # -----------------------------------------------------------------------
+  - job_name: "gateway"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8080"]
+        labels:
+          service: "gateway"
+
+  # -----------------------------------------------------------------------
+  # Distributed Inference Scheduler
+  # Exposes: scheduler_placements_total, scheduler_failovers_total,
+  #          scheduler_nodes_alive, scheduler_ensure_latency_seconds,
+  #          scheduler_heartbeats_total
+  # -----------------------------------------------------------------------
+  - job_name: "scheduler"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["scheduler:8030"]
+        labels:
+          service: "scheduler"
+
+  # -----------------------------------------------------------------------
+  # Node Agents (one per GPU server)
+  # Add more targets as you scale out nodes.
+  # Exposes: node_gpu_free_mb, node_gpu_total_mb, node_gpu_used_mb,
+  #          node_last_heartbeat_timestamp_seconds,
+  #          node_local_ensures_total, node_local_ensure_latency_seconds
+  # -----------------------------------------------------------------------
+  - job_name: "node_agent"
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "node_agent:8020"
+        labels:
+          service: "node_agent"

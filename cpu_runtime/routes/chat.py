@@ -22,8 +22,10 @@ import structlog
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from cpu_runtime import state as _state
 from cpu_runtime.config import settings as _settings
 from cpu_runtime.inference import GenerationRequest, get_engine
+from cpu_runtime.load_shedder import shedder as _shedder
 from cpu_runtime.observability import (
     CPU_ERRORS_TOTAL,
     CPU_INFERENCE_LATENCY,
@@ -44,11 +46,29 @@ async def chat_completions(request: Request) -> Any:
     """OpenAI-compatible chat completions via llama.cpp / GGUF."""
     global _active_requests
 
-    if _active_requests >= _settings.max_queue_depth:
+    # Reject immediately if service is draining for shutdown
+    if _state.shutting_down:
+        raise HTTPException(
+            status_code=503,
+            detail="Service is shutting down. Please retry another instance.",
+        )
+
+    # Determine effective concurrency ceiling.
+    # During latency spikes the ceiling is reduced proportionally so the
+    # system sheds load before the queue fills completely.
+    _ceiling = (
+        _shedder.effective_max_requests(
+            _settings.max_queue_depth,
+            _settings.latency_threshold_ms,
+        )
+        if _settings.dynamic_concurrency_enabled
+        else _settings.max_queue_depth
+    )
+    if _active_requests >= _ceiling:
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Server busy: {_active_requests}/{_settings.max_queue_depth} "
+                f"Server busy: {_active_requests}/{_ceiling} "
                 "requests in progress. Try again shortly."
             ),
             headers={"Retry-After": "5"},
@@ -73,6 +93,18 @@ async def chat_completions(request: Request) -> Any:
                 f"(limit {_settings.max_prompt_chars})."
             ),
         )
+
+    # RAM guard: reject if memory is critically low
+    if _settings.low_ram_mode_enabled:
+        free_mb = _shedder.check_ram()
+        if free_mb >= 0 and free_mb < _settings.min_free_ram_mb:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Insufficient memory: {free_mb} MiB free "
+                    f"(minimum {_settings.min_free_ram_mb} MiB)."
+                ),
+            )
 
     model_name = body.get("model", "cpu-model")
     stream: bool = bool(body.get("stream", False))
@@ -156,6 +188,7 @@ async def _unary_response(
     CPU_QUEUE_DEPTH.dec()
     CPU_INFERENCE_TOTAL.labels(model=model_name, status="200").inc()
     CPU_INFERENCE_LATENCY.labels(model=model_name).observe(elapsed)
+    _shedder.record_latency(elapsed * 1000)
 
     log.info(
         "cpu_inference_done",
@@ -209,6 +242,7 @@ def _streaming_response(
             CPU_QUEUE_DEPTH.dec()
             CPU_INFERENCE_TOTAL.labels(model=model_name, status=str(status_code)).inc()
             CPU_INFERENCE_LATENCY.labels(model=model_name).observe(elapsed)
+            _shedder.record_latency(elapsed * 1000)
             log.info(
                 "cpu_stream_done",
                 model=model_name,

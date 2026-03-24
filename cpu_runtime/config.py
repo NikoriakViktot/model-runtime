@@ -65,6 +65,20 @@ class Settings(BaseSettings):
     # falls below this threshold; readiness probe reflects the warning.
     min_free_ram_mb: int = 512
 
+    # Adaptive load shedding
+    # Rolling average latency threshold above which concurrency is reduced.
+    # 0.0 = disabled.
+    latency_threshold_ms: float = 5000.0
+    # When True, concurrency ceiling is lowered on latency spikes.
+    dynamic_concurrency_enabled: bool = True
+    # When True, low-RAM checks are enforced (503 / readiness fail).
+    low_ram_mode_enabled: bool = True
+    # How often to re-read /proc/meminfo (seconds).
+    ram_check_interval_sec: float = 5.0
+
+    # Graceful shutdown: max seconds to wait for active requests to drain.
+    shutdown_timeout_sec: float = 30.0
+
     # CORS: comma-separated list of allowed origins, or "*" to allow all
     cors_origins: str = "*"
 

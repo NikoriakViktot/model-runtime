@@ -46,7 +46,7 @@ if _REPO_ROOT not in sys.path:
 # ---------------------------------------------------------------------------
 
 _BEHAVIORAL_MARKERS = {
-    "invariant", "resilience", "streaming", "concurrency", "slow", "chaos",
+    "invariant", "resilience", "streaming", "concurrency", "slow", "chaos", "slo",
 }
 
 
@@ -167,6 +167,7 @@ class _CIMetricsPlugin:
                 "streaming": _status("streaming", ["stream", "sse", "mid_stream"]),
                 "concurrency": _status("concurrency", ["concurrent", "deadlock"]),
                 "chaos": _status("chaos", ["chaos", "random"]),
+                "slo": _status("slo", ["slo", "latency", "error_rate"]),
             },
             "latency_p95_ms": round(p95_ms, 1) if p95_ms is not None else None,
             "error_rate": round(failed / total, 4) if total > 0 else 0.0,

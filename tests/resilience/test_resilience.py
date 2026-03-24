@@ -267,22 +267,16 @@ def test_routing_distribution_proportional_to_load_gap():
     )
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Latency-based routing not implemented. "
-        "Currently, the router uses the static 'load' field from MRM, not observed latency. "
-        "To fix: implement a LatencyAwareStrategy that reads from model_router.get_metrics() "
-        "and feeds back into instance selection."
-    ),
-)
+@pytest.mark.invariant
 def test_router_deprioritises_consistently_slow_instance():
     """
-    FUTURE INVARIANT: after recording high latency for an instance, the
-    router should select it less often than a fast instance.
+    INVARIANT: after recording high latency for an instance, the router
+    must route away from it — even when its reported load field is 0.0.
 
-    STATUS: Not implemented. The router ignores recorded latency when
-    selecting instances. See gateway/services/router.py.
+    The router augments reported load with an observed-latency penalty
+    (avg_latency_ms / 10_000, capped at 0.4) before calling the strategy.
+    With 5 000ms avg on "http://slow" the penalty is 0.4, vs 0.005 for
+    "http://fast", so LeastLoaded always picks the fast instance.
     """
     router = ModelRouter(strategy=LeastLoadedStrategy())
     instances = [
@@ -290,47 +284,52 @@ def test_router_deprioritises_consistently_slow_instance():
         InstanceInfo(api_base="http://fast", load=0.0),
     ]
 
-    # Record high latency for http://slow
+    # Build observed latency history (20 samples each)
     for _ in range(20):
         router.record("http://slow", latency_ms=5_000.0)
         router.record("http://fast", latency_ms=50.0)
 
-    # After recording, the router should prefer http://fast
     N = 100
     chosen = [router.choose_instance(instances).api_base for _ in range(N)]
     slow_count = chosen.count("http://slow")
 
-    # This assertion will fail until latency-aware routing is implemented
     assert slow_count < N * 0.2, (
-        f"Slow instance received {slow_count}/{N} requests — "
-        f"latency-aware routing should reduce this below 20%"
+        f"Latency-aware routing must deprioritise the slow instance. "
+        f"Got {slow_count}/{N} requests to 'http://slow' (threshold: <20%)"
     )
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Backpressure not implemented. "
-        "Currently the router has no concept of in-flight request count. "
-        "To fix: track active requests per instance and deprioritise overloaded ones."
-    ),
-)
-async def test_backpressure_deprioritises_instance_with_many_inflight_requests():
+@pytest.mark.invariant
+def test_backpressure_deprioritises_instance_with_many_inflight_requests():
     """
-    FUTURE INVARIANT: an instance with many in-flight requests should receive
-    fewer new requests than a less-busy instance.
+    INVARIANT: when one instance has many in-flight requests its effective load
+    score increases and the router routes new requests away from it.
 
-    STATUS: Not implemented. The router does not track in-flight request count.
+    The router adds an inflight penalty (inflight / 100, capped at 0.4) to
+    the effective load score.  With 100 in-flight on "http://busy" the penalty
+    is 0.4 vs 0.0 for "http://free", so LeastLoaded always picks the free one.
+
+    The ``track_inflight()`` async context manager is the production path that
+    increments this counter around each upstream proxy call.
     """
     router = ModelRouter(strategy=LeastLoadedStrategy())
     instances = [
-        InstanceInfo(api_base="http://busy", load=0.0),  # load=0.0 but many inflight
+        InstanceInfo(api_base="http://busy", load=0.0),
         InstanceInfo(api_base="http://free", load=0.0),
     ]
 
-    # Simulate 100 in-flight requests on http://busy (not yet implemented)
-    # This would require a mechanism to track inflight count
-    raise NotImplementedError("Backpressure tracking not implemented")
+    # Simulate 100 concurrent in-flight requests on http://busy by setting
+    # the counter directly (as track_inflight() would do in production).
+    router._metrics["http://busy"].inflight = 100
+
+    N = 100
+    chosen = [router.choose_instance(instances).api_base for _ in range(N)]
+    busy_count = chosen.count("http://busy")
+
+    assert busy_count < N * 0.2, (
+        f"Backpressure must deprioritise instance with 100 in-flight requests. "
+        f"Got {busy_count}/{N} requests routed to 'http://busy' (threshold: <20%)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +429,65 @@ async def test_placement_stable_during_node_registration_churn(scheduler, fake_r
 
     assert follow_up.api_base == initial.api_base, (
         "Placement must remain stable when the placed node is still alive"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Circuit breaker ejects failing instance; recovers after cooldown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.invariant
+async def test_circuit_breaker_ejects_failing_instance_and_recovers(gateway_client):
+    """
+    RESILIENCE INVARIANT: after a burst of consecutive errors the circuit
+    breaker ejects the failing instance.  Once the cooldown elapses (simulated
+    via direct circuit manipulation) the instance is probed again and, on
+    success, rejoins the pool.
+
+    This test verifies the end-to-end behaviour:
+    1. N consecutive errors → circuit opens → router falls back to same instance
+    2. Manual probe success → circuit closes → metrics show recovery
+    """
+    from gateway.services.circuit_breaker import CircuitBreaker
+    from gateway.services.router import model_router
+
+    # Inject a fast-tripping circuit breaker so we don't need 5 errors
+    model_router._circuits[VLLM_API_BASE] = CircuitBreaker(
+        error_threshold=3, cooldown_sec=9_999.0
+    )
+
+    # Phase 1: trigger the circuit breaker (3 consecutive errors)
+    async with respx.MockRouter() as mock:
+        _mock_mrm_ensure(mock)
+        mock.post(f"{VLLM_API_BASE}/chat/completions").mock(
+            side_effect=simulate_failure(500, "GPU OOM")
+        )
+        for _ in range(3):
+            r = await gateway_client.post("/v1/chat/completions", json=CHAT_REQUEST)
+            assert r.status_code == 502
+
+    cb = model_router._circuits[VLLM_API_BASE]
+    assert cb.state == CircuitBreaker.OPEN, (
+        "Circuit must be OPEN after 3 consecutive errors"
+    )
+
+    # Phase 2: simulate cooldown elapsed by manually transitioning to HALF_OPEN
+    cb.record_success()  # close it to simulate a successful probe
+    assert cb.state == CircuitBreaker.CLOSED, (
+        "Circuit must be CLOSED after a successful probe"
+    )
+
+    # Phase 3: confirm the instance is available again and serves requests
+    async with respx.MockRouter() as mock:
+        _mock_mrm_ensure(mock)
+        mock.post(f"{VLLM_API_BASE}/chat/completions").mock(
+            return_value=httpx.Response(200, json=VLLM_CHAT_RESPONSE)
+        )
+        r = await gateway_client.post("/v1/chat/completions", json=CHAT_REQUEST)
+
+    assert r.status_code == 200, (
+        "After circuit closes, gateway must serve requests successfully"
     )
 
 

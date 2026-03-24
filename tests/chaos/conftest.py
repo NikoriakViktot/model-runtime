@@ -59,6 +59,14 @@ async def scheduler(fake_redis):
     return Scheduler(registry, placements)
 
 
+@pytest.fixture(autouse=True)
+def reset_model_router_metrics():
+    """Reset ModelRouter metrics before each test to prevent cross-test pollution."""
+    from gateway.services.router import model_router
+    model_router.reset_metrics()
+    yield
+
+
 @pytest.fixture
 async def gateway_client(monkeypatch):
     from gateway.config import settings as gw_settings

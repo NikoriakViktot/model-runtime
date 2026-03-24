@@ -135,14 +135,15 @@ services:
       GATEWAY_USE_SCHEDULER: "false"
       GATEWAY_MLFLOW_ENABLED: "false"
       GATEWAY_AUTO_PROVISION: "false"
-      # Map GPU model IDs to their CPU GGUF equivalents.
-      # Format: "gpu-model-id:cpu-alias,..."
-      # Example: "Qwen/Qwen1.5-1.8B-Chat:cpu-model"
-      GATEWAY_CPU_MODEL_MAP: ${GATEWAY_CPU_MODEL_MAP:-}
-      # In LITE mode, prefer CPU for short requests (auto-routing).
-      # Set to 0 to disable CPU auto-routing (manual via runtime_preference).
-      # Set to 99999 to always use CPU.
-      GATEWAY_CPU_ROUTING_MAX_TOKENS_THRESHOLD: ${CPU_ROUTING_THRESHOLD:-300}
+      # Map GPU model IDs to the CPU runtime alias.
+      # Format: "gpu-model-id:cpu-alias,another-gpu-id:cpu-alias"
+      # Default: map the CPU alias to itself so direct requests with that name work.
+      # Users may add GPU→CPU mappings: GATEWAY_CPU_MODEL_MAP=Qwen/Qwen1.5-1.8B-Chat:cpu-model
+      GATEWAY_CPU_MODEL_MAP: ${GATEWAY_CPU_MODEL_MAP:-${CPU_MODEL_ALIAS:-cpu-model}:${CPU_MODEL_ALIAS:-cpu-model}}
+      # In LITE mode, route ALL requests to CPU by default (99999 = always CPU).
+      # Override via CPU_ROUTING_THRESHOLD env var.
+      # Set to 300 to only route short requests to CPU (mixed GPU+CPU mode).
+      GATEWAY_CPU_ROUTING_MAX_TOKENS_THRESHOLD: ${CPU_ROUTING_THRESHOLD:-99999}
       # Block streaming on CPU runtime (slower, may timeout)
       GATEWAY_CPU_ROUTING_BLOCK_STREAMING: "false"
       LOG_FORMAT: "json"
@@ -175,7 +176,7 @@ services:
       gateway:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8502/_stcore/health || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8502/_stcore/health')\""]
       interval: 15s
       timeout: 5s
       retries: 10

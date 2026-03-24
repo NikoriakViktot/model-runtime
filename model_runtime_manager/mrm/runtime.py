@@ -288,21 +288,38 @@ def build_spec_from_config(
 
 def _is_nvidia_runtime_error(exc: Exception) -> bool:
     """Return True when the Docker API error indicates that the nvidia container
-    runtime is not installed — so we know it's safe to fall back to CPU."""
-    msg = str(exc).lower()
+    runtime is not installed — so we know it's safe to fall back to CPU.
+
+    docker.errors.APIError has a custom __str__ that formats to
+    "{status} Server Error for {url}: {reason}" — the original message
+    passed to the constructor is only in exc.args[0] and exc.explanation.
+    We check all three sources to be thorough.
+    """
+    import docker.errors
+    # Only treat Docker API errors as nvidia-unavailable, not our own
+    # RuntimeError409 (which means GPU is busy or model not found).
+    if not isinstance(exc, docker.errors.APIError):
+        return False
+
     nvidia_keywords = [
         "unknown runtime",
         "nvidia",
         "could not select device driver",
         "no such runtime",
         "runtime not found",
+        "no devices found",
+        "failed to initialize nvml",
+        "oci runtime create failed",
     ]
-    # Only treat Docker API errors as nvidia-unavailable, not our own
-    # RuntimeError409 (which means GPU is busy or model not found).
-    import docker.errors
-    if isinstance(exc, docker.errors.APIError):
-        return any(kw in msg for kw in nvidia_keywords)
-    return False
+
+    # Check str(exc), exc.explanation, and the raw constructor message (args[0])
+    candidates = [str(exc).lower()]
+    if getattr(exc, "explanation", None):
+        candidates.append(str(exc.explanation).lower())
+    if exc.args:
+        candidates.append(str(exc.args[0]).lower())
+
+    return any(kw in candidate for kw in nvidia_keywords for candidate in candidates)
 
 
 class ModelRuntimeManager:

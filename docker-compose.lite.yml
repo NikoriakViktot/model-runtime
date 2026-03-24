@@ -8,6 +8,7 @@
 # Usage:
 #   CPU-only:         docker compose -f docker-compose.lite.yml up
 #   With GPU:         docker compose -f docker-compose.lite.yml -f docker-compose.gpu.yml up
+#   With UI:          docker compose -f docker-compose.lite.yml --profile ui up
 #
 # Prerequisites:
 #   1. Copy .env.lite to .env and fill HF_TOKEN (optional) + GGUF_MODELS_PATH
@@ -19,6 +20,12 @@
 #                  Qwen2.5-1.5B-Instruct-Q4_K_M.gguf --local-dir ./hf_cache/gguf \
 #                  --local-dir-use-symlinks False && \
 #                mv ./hf_cache/gguf/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf ./hf_cache/gguf/model.gguf
+#
+# Port mapping (avoids conflict with dev stack on 8080/8502/8010):
+#   Gateway   → http://localhost:${LITE_GATEWAY_PORT:-8181}
+#   MRM       → http://localhost:${LITE_MRM_PORT:-8011}
+#   CPU RT    → http://localhost:${LITE_CPU_PORT:-8091}
+#   Frontend  → http://localhost:${LITE_FRONTEND_PORT:-8192}   (--profile ui)
 
 version: "3.9"
 
@@ -43,15 +50,55 @@ services:
     networks: [ai_net]
     restart: unless-stopped
 
+  # ── Docker Socket Proxy ────────────────────────────────────────────
+  # Restricts MRM's Docker API access to only the operations it needs.
+  # MRM never touches the raw socket; it talks to this proxy instead.
+  socket_proxy:
+    image: tecnativa/docker-socket-proxy:0.3
+    container_name: lite_socket_proxy
+    environment:
+      # Allow only container and image operations — deny everything else
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      POST: 1       # allow POST (create/start/stop/remove)
+      DELETE: 1     # allow DELETE (remove containers)
+      # Block privileged endpoints
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EXEC: 0
+      GRPC: 0
+      INFO: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [ai_net]
+    restart: unless-stopped
+
   # ── CPU Inference Runtime (llama.cpp / GGUF) ───────────────────────
   # Always on in LITE mode. The gateway routes here when GPU is absent.
   # Build once: docker build -t model-runtime-cpu:latest ./cpu_runtime
+  #
+  # WARNING: without a GGUF model file at ${GGUF_MODELS_PATH}/model.gguf
+  #          this service will start but /health will return 503 until
+  #          the model finishes loading (or fail on missing file).
   cpu_runtime:
     image: model-runtime-cpu:latest
     container_name: lite_cpu_runtime
     command: uvicorn cpu_runtime.app:app --host 0.0.0.0 --port 8090
     ports:
-      - "8090:8090"
+      - "${LITE_CPU_PORT:-8091}:8090"
     environment:
       # Path to the GGUF model file INSIDE the container (mounted below)
       CPU_RUNTIME_MODEL_PATH: /models/model.gguf
@@ -62,13 +109,18 @@ services:
       # Small context = lower RAM usage
       CPU_RUNTIME_N_CTX: ${CPU_N_CTX:-2048}
       CPU_RUNTIME_MAX_TOKENS_DEFAULT: "256"
+      # Backpressure: reject requests beyond this queue depth (returns 429)
+      CPU_RUNTIME_MAX_QUEUE_DEPTH: ${CPU_MAX_QUEUE_DEPTH:-8}
+      # CORS: comma-separated list of allowed origins, or "*" to allow all
+      CPU_RUNTIME_CORS_ORIGINS: ${CORS_ORIGINS:-*}
       LOG_FORMAT: "json"
     volumes:
       # Host directory that contains model.gguf (read-only)
       - ${GGUF_MODELS_PATH:-./hf_cache/gguf}:/models:ro
     healthcheck:
-      # Pure Python probe — no curl needed
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/health')\""]
+      # /ready returns 503 while loading, 200 when the model is fully loaded.
+      # /health is liveness only (always 200); use /ready for readiness here.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/ready')\""]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -85,12 +137,13 @@ services:
   # ── Model Runtime Manager ──────────────────────────────────────────
   # NO "runtime: nvidia" here — MRM manages containers but doesn't need GPU itself.
   # GPU support is added via docker-compose.gpu.yml overlay.
+  # Docker access goes through socket_proxy (principle of least privilege).
   model_runtime_manager:
     build: ./model_runtime_manager
     container_name: lite_mrm
     command: uvicorn mrm.app:app --host 0.0.0.0 --port 8010
     ports:
-      - "8010:8010"
+      - "${LITE_MRM_PORT:-8011}:8010"
     environment:
       MRM_REDIS_URL: redis://redis:6379/2
       MRM_DOCKER_NETWORK: ai_net_lite
@@ -105,8 +158,10 @@ services:
       MRM_AUTO_FALLBACK_CPU_ALIAS: ${CPU_MODEL_ALIAS:-cpu-model}
       HF_TOKEN: ${HF_TOKEN:-}
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      # Route Docker API calls through the socket proxy (not the raw socket)
+      DOCKER_HOST: tcp://socket_proxy:2375
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # No docker.sock mount — MRM uses socket_proxy instead
       - ./artifacts:/artifacts
       - ./hf_cache:/app_host/hf_cache
     depends_on:
@@ -114,6 +169,8 @@ services:
         condition: service_healthy
       cpu_runtime:
         condition: service_healthy
+      socket_proxy:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8010/health')\""]
       interval: 10s
@@ -129,7 +186,7 @@ services:
     container_name: lite_gateway
     command: uvicorn gateway.main:app --host 0.0.0.0 --port 8080
     ports:
-      - "8080:8080"
+      - "${LITE_GATEWAY_PORT:-8181}:8080"
     environment:
       GATEWAY_MRM_URL: http://model_runtime_manager:8010
       GATEWAY_USE_SCHEDULER: "false"
@@ -146,6 +203,8 @@ services:
       GATEWAY_CPU_ROUTING_MAX_TOKENS_THRESHOLD: ${CPU_ROUTING_THRESHOLD:-99999}
       # Block streaming on CPU runtime (slower, may timeout)
       GATEWAY_CPU_ROUTING_BLOCK_STREAMING: "false"
+      # CORS: comma-separated list of allowed origins, or "*" to allow all
+      GATEWAY_CORS_ORIGINS: ${CORS_ORIGINS:-*}
       LOG_FORMAT: "json"
     depends_on:
       model_runtime_manager:
@@ -165,7 +224,7 @@ services:
     container_name: lite_frontend
     command: streamlit run ui/app.py --server.port=8502 --server.address=0.0.0.0
     ports:
-      - "8502:8502"
+      - "${LITE_FRONTEND_PORT:-8192}:8502"
     environment:
       GATEWAY_URL: http://gateway:8080
       MRM_URL: http://model_runtime_manager:8010
@@ -187,4 +246,4 @@ services:
           memory: "512M"
     networks: [ai_net]
     restart: unless-stopped
-    profiles: [ui]    # opt-in: docker compose --profile ui up
+    profiles: [ui]    # opt-in: docker compose -f docker-compose.lite.yml --profile ui up

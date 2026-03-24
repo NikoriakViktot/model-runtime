@@ -15,49 +15,27 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-# ── /health endpoint ─────────────────────────────────────────────────
+# ── /health liveness probe ────────────────────────────────────────────
 
 class TestHealthEndpoint:
-    """The /health endpoint must return 503 until the engine is loaded."""
+    """/health is a liveness probe — always 200 regardless of model state."""
 
-    def setup_method(self):
-        # Reset module-level engine singleton before each test
+    def test_health_always_200(self):
+        """/health must return 200 even before the model has loaded."""
         import cpu_runtime.inference as inf_mod
-        self._orig_engine = inf_mod.engine
-        inf_mod.engine = None
-
-    def teardown_method(self):
-        import cpu_runtime.inference as inf_mod
-        inf_mod.engine = self._orig_engine
-
-    def test_health_503_when_engine_none(self):
-        """Before model load: /health must return 503."""
-        import cpu_runtime.inference as inf_mod
-        inf_mod.engine = None
-
-        # Import app after patching the singleton
-        from cpu_runtime.app import app
-        client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/health")
-        assert resp.status_code == 503
-        assert resp.json()["status"] == "loading"
-
-    def test_health_200_when_engine_loaded(self):
-        """After model load: /health must return 200."""
-        import cpu_runtime.inference as inf_mod
-        from cpu_runtime.config import settings
-
-        mock_engine = MagicMock()
-        mock_engine.generate = AsyncMock()
-        inf_mod.engine = mock_engine
-
-        from cpu_runtime.app import app
-        client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert "model" in data
+        orig_engine = inf_mod.engine
+        orig_state = inf_mod.load_state
+        try:
+            inf_mod.engine = None
+            inf_mod.load_state = "loading"
+            from cpu_runtime.app import app
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.get("/health")
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "ok"
+        finally:
+            inf_mod.engine = orig_engine
+            inf_mod.load_state = orig_state
 
 
 # ── LlamaCppEngine.load() error handling ─────────────────────────────

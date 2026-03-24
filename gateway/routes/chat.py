@@ -26,6 +26,7 @@ This lets clients pass a raw HuggingFace repo ID without pre-registering.
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any
 
@@ -53,6 +54,7 @@ from gateway.services.mrm_client import (
     mrm,
 )
 from gateway.services.proxy import UpstreamError, proxy
+from gateway.services.retry import call_with_retry
 from gateway.services.router import model_router
 from gateway.services.scheduler_client import (
     SchedulerError,
@@ -166,6 +168,10 @@ async def chat_completions(request: Request) -> Any:
     proxy_body = {k: v for k, v in body.items() if k != "runtime_preference"}
     proxy_body["model"] = model_alias
     client_headers = dict(request.headers)
+    # Ensure the gateway-generated request_id is forwarded to upstream
+    _rid = getattr(request.state, "request_id", "")
+    if _rid:
+        client_headers["x-request-id"] = _rid
 
     # ------------------------------------------------------------------
     # 4. Forward to vLLM
@@ -334,6 +340,8 @@ async def _handle_unary(
     runtime_type: str = "gpu",
 ) -> JSONResponse:
     """Forward a non-streaming request and return a JSON response."""
+    request_id = headers.get("x-request-id", "")
+
     with tracer.start_as_current_span("gateway.proxy") as span:
         try:
             span.set_attribute("target_url", target_url)
@@ -344,7 +352,18 @@ async def _handle_unary(
 
         try:
             async with model_router.track_inflight(api_base):
-                result = await proxy.post(target_url, payload, client_headers=headers)
+                result = await call_with_retry(
+                    lambda: proxy.post(target_url, payload, client_headers=headers),
+                    max_retries=settings.retry_max,
+                    jitter_min_ms=settings.retry_jitter_min_ms,
+                    jitter_max_ms=settings.retry_jitter_max_ms,
+                    request_id=request_id,
+                    on_retry=lambda attempt, exc: model_router.record(
+                        api_base,
+                        latency_ms=(time.perf_counter() - t0) * 1000,
+                        error=True,
+                    ),
+                )
         except UpstreamError as exc:
             latency_ms = (time.perf_counter() - t0) * 1000
             model_router.record(api_base, latency_ms=latency_ms, error=True)

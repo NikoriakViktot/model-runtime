@@ -76,3 +76,12 @@ control_plane/.venv
 
 test-results/
 
+artifacts/
+
+hf_cache/
+
+.claude/
+
+
+
+.env.lite

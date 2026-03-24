@@ -85,6 +85,9 @@ class Scheduler:
             hostname=payload.hostname,
             gpus=payload.gpus,
             last_heartbeat=time.time(),
+            has_gpu=payload.has_gpu,
+            cpu_cores=payload.cpu_cores,
+            cpu_load=payload.cpu_load,
         )
         await self._registry.upsert(node)
         HEARTBEATS_TOTAL.labels(node_id=payload.node_id).inc()
@@ -100,7 +103,9 @@ class Scheduler:
     # Ensure
     # ------------------------------------------------------------------
 
-    async def ensure(self, model_id: str) -> EnsureResponse:
+    async def ensure(
+        self, model_id: str, runtime_preference: str = "auto"
+    ) -> EnsureResponse:
         """
         Ensure the model is running somewhere in the cluster.
 
@@ -160,11 +165,29 @@ class Scheduler:
                         ENSURE_LATENCY.labels(model=model_id, path="cache_hit").observe(elapsed)
                         return _to_response(placement)
 
-                nodes = await self._registry.list_alive()
-                NODES_ALIVE.set(len(nodes))
+                all_nodes = await self._registry.list_alive()
+                NODES_ALIVE.set(len(all_nodes))
 
-                if not nodes:
+                if not all_nodes:
                     raise RuntimeError("No healthy nodes available in the cluster")
+
+                # Filter nodes by runtime capability.
+                # CPU models can land on any node; GPU models require GPU nodes.
+                if runtime_preference == "cpu":
+                    nodes = [n for n in all_nodes if n.can_serve_cpu]
+                    if not nodes:
+                        log.warning("no_cpu_nodes_fallback_gpu", model=model_id)
+                        nodes = all_nodes   # graceful fallback
+                elif runtime_preference == "gpu":
+                    nodes = [n for n in all_nodes if n.can_serve_gpu]
+                    if not nodes:
+                        raise RuntimeError(
+                            f"No GPU-capable nodes available for model '{model_id}'"
+                        )
+                else:
+                    # "auto": prefer GPU nodes; fall back to all nodes
+                    gpu_nodes = [n for n in all_nodes if n.can_serve_gpu]
+                    nodes = gpu_nodes if gpu_nodes else all_nodes
 
                 node = self._strategy.select_node(nodes, model_id)
                 log.info(
@@ -189,6 +212,16 @@ class Scheduler:
                     strategy_used=type(self._strategy).__name__,
                 )
                 await self._placements.save(placement)
+
+                # RUNTIME INVARIANT: placement must be immediately readable after
+                # save.  If Redis is unavailable or silently dropping writes this
+                # will surface as a RuntimeError rather than a silent wrong answer.
+                _verify = await self._placements.get(model_id)
+                if _verify is None or not _verify.instances:
+                    raise RuntimeError(
+                        f"Placement invariant violated: placement for '{model_id}' "
+                        "was not persisted.  Redis may be unavailable or rejecting writes."
+                    )
 
                 elapsed = time.perf_counter() - t_start
                 ENSURE_LATENCY.labels(model=model_id, path="new_placement").observe(elapsed)
@@ -274,6 +307,7 @@ class Scheduler:
             api_base=d["api_base"],
             gpu=d.get("gpu", ""),
             state=d.get("state", "READY"),
+            runtime_type=d.get("runtime_type", "gpu"),
         )
 
     async def _call_node_stop(self, node: Node, model_id: str) -> None:
@@ -295,9 +329,11 @@ class Scheduler:
 
 def _to_response(placement: Placement) -> EnsureResponse:
     primary = placement.instances[0] if placement.instances else None
+    runtime_type = primary.runtime_type if primary else "gpu"
     return EnsureResponse(
         model_id=placement.model_id,
         model_alias=primary.model_alias if primary else placement.model_id,
         api_base=primary.api_base if primary else "",
         instances=placement.instances,
+        runtime_type=runtime_type,
     )

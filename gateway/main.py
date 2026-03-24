@@ -150,10 +150,12 @@ async def observability_middleware(request: Request, call_next):
     t0 = time.perf_counter()
     request.state.t0 = t0
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    finally:
+        IN_FLIGHT.dec()
 
     latency_ms = (time.perf_counter() - t0) * 1000
-    IN_FLIGHT.dec()
 
     log.info(
         "http_request",
@@ -190,15 +192,24 @@ async def health():
 
 @app.get("/ready", tags=["Operations"], summary="Gateway readiness probe")
 async def ready():
-    """Returns 200 if MRM is reachable, 503 otherwise."""
-    try:
-        await mrm.status_all()
-        return {"status": "ready", "mrm": settings.mrm_url}
-    except Exception as exc:
+    """Returns 200 if the active backend is reachable, 503 otherwise."""
+    if settings.use_scheduler:
+        result = await scheduler_client.health()
+        if result.get("ok"):
+            return {"status": "ready", "ok": True, **result}
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "reason": str(exc)},
+            content={"status": "not_ready", "ok": False, **result},
         )
+    else:
+        try:
+            await mrm.status_all()
+            return {"status": "ready", "ok": True, "mrm": settings.mrm_url}
+        except Exception as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready", "ok": False, "reason": str(exc)},
+            )
 
 
 @app.get("/", include_in_schema=False)

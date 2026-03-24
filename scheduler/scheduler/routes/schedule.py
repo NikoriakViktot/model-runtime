@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 
 from scheduler.models import EnsureRequest, EnsureResponse, Placement, StopRequest
 
@@ -32,7 +33,7 @@ async def schedule_ensure(body: EnsureRequest, request: Request) -> EnsureRespon
     """
     scheduler = request.app.state.scheduler
     try:
-        return await scheduler.ensure(body.model)
+        return await scheduler.ensure(body.model, runtime_preference=body.runtime_preference)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
@@ -41,7 +42,8 @@ async def schedule_ensure(body: EnsureRequest, request: Request) -> EnsureRespon
 
 
 @router.post("/schedule/stop", status_code=204, tags=["Schedule"],
-             summary="Stop a model on all nodes and remove its placement")
+             summary="Stop a model on all nodes and remove its placement",
+             response_model=None, response_class=Response)
 async def schedule_stop(body: StopRequest, request: Request) -> None:
     """
     Stop the model on every node where it is currently placed and delete

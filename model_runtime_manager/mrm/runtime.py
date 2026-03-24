@@ -9,7 +9,7 @@ import asyncio
 import docker
 import requests
 from redis import Redis
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator as pydantic_validator
 from typing import Any, Dict,  Literal, List
 
 from .config import Settings, ModelSpec
@@ -69,6 +69,25 @@ class RegisterReq(BaseModel):
     spec: ModelSpec
 
 
+CPU_PRESETS: Dict[str, Dict[str, Any]] = {
+    # 7B GGUF Q4_K_M — fits in ~6 GB RAM, 4 cores, ~8-12 tok/s
+    "cpu_7b_q4": dict(
+        image="model-runtime-cpu:latest",   # built from cpu_runtime/Dockerfile
+        port=8090,
+        cpu_cores=4,
+        memory_mb=6144,
+        n_ctx=4096,
+    ),
+    # 3B GGUF Q4_K_M — fits in ~3 GB RAM, 2 cores, ~20 tok/s
+    "cpu_3b_q4": dict(
+        image="model-runtime-cpu:latest",
+        port=8090,
+        cpu_cores=2,
+        memory_mb=3072,
+        n_ctx=2048,
+    ),
+}
+
 PRESETS: Dict[str, Dict[str, Any]] = {
     "small_chat": dict(
         image="vllm/vllm-openai:v0.13.0",
@@ -125,6 +144,17 @@ class PlanFromHFReq(BaseModel):
     preset: Literal["small_chat", "7b_awq"]
     gpu: str = "0"
     overrides: Dict[str, Any] = Field(default_factory=dict)
+
+    @pydantic_validator("gpu")
+    @classmethod
+    def _validate_gpu(cls, v: str) -> str:
+        v = str(v).strip()
+        if not v.isdigit():
+            raise ValueError(
+                f"gpu must be an integer GPU index (e.g. '0', '1') — got '{v}'. "
+                "Did you accidentally pass gpu_memory_utilization?"
+            )
+        return v
 
 
 def _slug(s: str) -> str:
@@ -193,6 +223,86 @@ def register_from_hf(self, req: PlanFromHFReq) -> Dict[str, Any]:
         "gpu": req.gpu,
         "applied_overrides": {k: v for k, v in (req.overrides or {}).items() if k in _ALLOWED_OVERRIDES},
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dynamic (auto-fit) registration — builds ModelSpec from VllmConfig
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_spec_from_config(
+    repo_id: str,
+    final_repo_id: str,         # may differ if quant alternative was selected
+    config,                      # VllmConfig
+    gpu: str,
+    settings: "Settings",
+) -> "ModelSpec":
+    """
+    Build a ModelSpec from a dynamically generated VllmConfig.
+    Uses sensible structural defaults (image, seqs, LoRA, etc.)
+    that are independent of preset logic.
+    """
+    alias          = _slug(final_repo_id.split("/")[-1])
+    safe           = _slug(final_repo_id)
+    container_name = ("vllm_" + safe)[:55]
+
+    # Env / volumes from settings (same as default registry)
+    base_env = {
+        "AWS_ACCESS_KEY_ID":       os.getenv("AWS_ACCESS_KEY_ID", ""),
+        "AWS_SECRET_ACCESS_KEY":   os.getenv("AWS_SECRET_ACCESS_KEY", ""),
+        "AWS_DEFAULT_REGION":      os.getenv("AWS_DEFAULT_REGION", ""),
+        "HF_TOKEN":                os.getenv("HF_TOKEN", ""),
+        "HUGGINGFACE_HUB_TOKEN":   os.getenv("HF_TOKEN", ""),
+        "HUGGING_FACE_HUB_TOKEN":  os.getenv("HF_TOKEN", ""),
+    }
+
+    art = os.path.abspath(settings.artifacts_host_path)
+    hfc = os.path.abspath(settings.hf_cache_host_path)
+    volumes = {art: "/app/artifacts", hfc: "/root/.cache/huggingface"}
+
+    return ModelSpec(
+        base_model            = repo_id,          # original repo for registry key
+        model_alias           = alias,
+        container_name        = container_name,
+        image                 = "vllm/vllm-openai:v0.13.0",
+        launch_mode           = "openai",
+        hf_model              = final_repo_id,    # actual model to download
+        served_model_name     = alias,
+        allowed_gpus          = [gpu],
+        port                  = 8000,
+        gpu_memory_utilization= config.gpu_memory_utilization,
+        max_model_len         = config.max_model_len,
+        max_num_seqs          = 1,
+        max_num_batched_tokens= 1024,
+        enable_lora           = True,
+        max_loras             = 10,
+        max_lora_rank         = 32,
+        enforce_eager         = True,
+        quantization          = config.quantization,
+        dtype                 = config.dtype,
+        shm_size              = "8gb",
+        ipc_host              = True,
+        volumes               = volumes,
+        env                   = base_env,
+    )
+
+
+def _is_nvidia_runtime_error(exc: Exception) -> bool:
+    """Return True when the Docker API error indicates that the nvidia container
+    runtime is not installed — so we know it's safe to fall back to CPU."""
+    msg = str(exc).lower()
+    nvidia_keywords = [
+        "unknown runtime",
+        "nvidia",
+        "could not select device driver",
+        "no such runtime",
+        "runtime not found",
+    ]
+    # Only treat Docker API errors as nvidia-unavailable, not our own
+    # RuntimeError409 (which means GPU is busy or model not found).
+    import docker.errors
+    if isinstance(exc, docker.errors.APIError):
+        return any(kw in msg for kw in nvidia_keywords)
+    return False
 
 
 class ModelRuntimeManager:
@@ -600,12 +710,157 @@ class ModelRuntimeManager:
 
         return c.id
 
+    def _start_cpu_container(self, spec: ModelSpec) -> str:
+        """
+        Start a cpu_runtime container for a GGUF model.
+
+        Key differences from vLLM:
+        - No GPU device assignment or reservation
+        - Uses cpu_runtime Docker image
+        - Passes GGUF path and thread count via env vars
+        - Memory limit enforced via Docker nano_cpus + mem_limit
+        """
+        self._maybe_remove_container(spec.container_name)
+
+        env = dict(spec.env or {})
+        env["CPU_RUNTIME_MODEL_PATH"] = spec.gguf_path or "/models/model.gguf"
+        env["CPU_RUNTIME_MODEL_ALIAS"] = spec.served_model_name
+        env["CPU_RUNTIME_N_THREADS"] = str(spec.cpu_cores)
+        env["CPU_RUNTIME_N_CTX"] = str(spec.max_model_len)
+        env["LOG_FORMAT"] = "json"
+
+        volumes = {}
+        for host_path, container_path in (spec.volumes or {}).items():
+            volumes[host_path] = {"bind": container_path, "mode": "rw"}
+
+        logger.info(
+            "🚀 Starting CPU container name=%s image=%s threads=%s gguf=%s",
+            spec.container_name,
+            spec.image,
+            spec.cpu_cores,
+            spec.gguf_path,
+        )
+
+        c = self.docker.containers.run(
+            spec.image,
+            detach=True,
+            name=spec.container_name,
+            network=self.s.docker_network,
+            environment=env,
+            volumes=volumes,
+            # Resource limits: no GPU, bounded CPU + RAM
+            nano_cpus=int(spec.cpu_cores * 1e9),
+            mem_limit=f"{spec.memory_mb}m",
+        )
+
+        logger.info("🐳 CPU container created: name=%s id=%s", spec.container_name, c.id)
+        return c.id
+
     # -------------------------
     # Public API
     # -------------------------
     def ensure_running(self, base_model: str) -> Dict[str, Any]:
         spec = self._spec(base_model)
 
+        # CPU models use a separate, simpler path — no GPU allocation needed
+        if getattr(spec, "runtime", "gpu") == "cpu":
+            return self._ensure_cpu(base_model, spec)
+
+        try:
+            return self._ensure_gpu(base_model, spec)
+        except Exception as exc:
+            # If the Docker nvidia runtime is missing AND a CPU fallback URL is
+            # configured (LITE mode), transparently serve via cpu_runtime instead.
+            fallback_url = self.s.auto_fallback_cpu_url
+            if fallback_url and _is_nvidia_runtime_error(exc):
+                logger.warning(
+                    "GPU runtime unavailable for %s (%s). "
+                    "Falling back to CPU runtime at %s",
+                    base_model, exc, fallback_url,
+                )
+                return self._fallback_to_cpu_runtime(base_model, spec, fallback_url)
+            raise
+
+    def _fallback_to_cpu_runtime(
+        self, base_model: str, spec: ModelSpec, cpu_url: str
+    ) -> Dict[str, Any]:
+        """Return the pre-running cpu_runtime service as the backend for this model."""
+        cpu_alias = self.s.auto_fallback_cpu_alias
+        api_base = f"{cpu_url.rstrip('/')}/v1"
+        self._set_state(base_model, {
+            "state": "READY",
+            "model_alias": cpu_alias,
+            "api_base": api_base,
+            "runtime_type": "cpu",
+            "gpu": "",
+            "last_used": _now(),
+        })
+        return {
+            "base_model": base_model,
+            "model_alias": cpu_alias,
+            "api_base": api_base,
+            "container": "cpu_runtime",
+            "gpu": "",
+            "state": "READY",
+            "runtime_type": "cpu",
+            "fallback": True,
+        }
+
+    def _ensure_cpu(self, base_model: str, spec: ModelSpec) -> Dict[str, Any]:
+        """
+        Ensure a CPU (GGUF / llama.cpp) model container is running.
+
+        No GPU reservation. No OOM fallback ladder.
+        The container is lightweight enough that a single start attempt suffices.
+        """
+        if not self._acquire_lock(base_model):
+            raise RuntimeError409("Model is being started/stopped by another request")
+
+        try:
+            st = self._get_state(base_model)
+            c = self._container_get(spec.container_name)
+
+            if c and self._container_is_running(c):
+                self._set_state(base_model, {"state": "READY", "container_id": c.id, "last_used": _now()})
+                return self._cpu_ensure_result(base_model, spec, c.id)
+
+            if c and not self._container_is_running(c):
+                self._set_state(base_model, {"state": "STARTING", "last_used": _now()})
+                self._container_start(c)
+                self._wait_ready(spec)
+                self._set_state(base_model, {"state": "READY", "last_used": _now()})
+                return self._cpu_ensure_result(base_model, spec, c.id)
+
+            # Fresh start
+            self._set_state(base_model, {"state": "STARTING", "last_used": _now()})
+            cid = self._start_cpu_container(spec)
+            self._set_state(base_model, {"container_id": cid})
+            self._wait_ready(spec)
+            self._log_ready(spec)
+            self._set_state(base_model, {"state": "READY", "last_used": _now()})
+            return self._cpu_ensure_result(base_model, spec, cid)
+
+        except Exception as e:
+            logger.error("CPU ENSURE ERROR for %s: %s", base_model, e)
+            self._maybe_remove_container(spec.container_name)
+            self._set_state(base_model, {"state": "ABSENT"})
+            raise
+        finally:
+            self._release_lock(base_model)
+
+    def _cpu_ensure_result(self, base_model: str, spec: ModelSpec, container_id: str) -> Dict[str, Any]:
+        return {
+            "base_model": base_model,
+            "model_alias": spec.model_alias,
+            "api_base": self._api_base(spec),
+            "container": spec.container_name,
+            "gpu": "",          # no GPU for CPU runtime
+            "state": "READY",
+            "runtime_type": "cpu",
+        }
+
+    def _ensure_gpu(self, base_model: str, spec: ModelSpec) -> Dict[str, Any]:
+        """Original GPU (vLLM) ensure logic — unchanged."""
         if not self._acquire_lock(base_model):
             raise RuntimeError409("Model is being started/stopped by another request")
 
@@ -629,6 +884,7 @@ class ModelRuntimeManager:
                     "container": spec.container_name,
                     "gpu": gpu,
                     "state": "READY",
+                    "runtime_type": "gpu",
                 }
 
             if c and not self._container_is_running(c):
@@ -651,6 +907,7 @@ class ModelRuntimeManager:
                     "container": spec.container_name,
                     "gpu": gpu,
                     "state": "READY",
+                    "runtime_type": "gpu",
                 }
 
             # Fresh start
@@ -693,6 +950,7 @@ class ModelRuntimeManager:
                 "container": spec.container_name,
                 "gpu": gpu,
                 "state": "READY",
+                "runtime_type": "gpu",
             }
 
         except Exception as e:

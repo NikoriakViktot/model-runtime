@@ -14,6 +14,7 @@ import time
 import httpx
 import structlog
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 
 from node_agent.heartbeat import send_heartbeat
 from node_agent.models import (
@@ -96,7 +97,8 @@ async def local_ensure(body: LocalEnsureRequest) -> LocalEnsureResponse:
     return result
 
 
-@router.post("/local/stop", status_code=204, summary="Stop a model on this node")
+@router.post("/local/stop", status_code=204, summary="Stop a model on this node",
+             response_model=None, response_class=Response)
 async def local_stop(body: LocalStopRequest) -> None:
     """
     Call local MRM /models/stop.
@@ -135,6 +137,8 @@ async def local_status_model(model_id: str) -> LocalStatusResponse:
     "/heartbeat",
     status_code=204,
     summary="Trigger an immediate heartbeat to the Scheduler",
+    response_model=None,
+    response_class=Response,
 )
 async def trigger_heartbeat(request: Request) -> None:
     """

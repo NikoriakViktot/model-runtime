@@ -66,9 +66,9 @@ async def create_embeddings(request: Request) -> JSONResponse:
             client_headers=dict(request.headers),
         )
     except UpstreamError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Embeddings service error: {exc}",
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": str(exc)},
         )
 
     logger.debug("POST /v1/embeddings → %d embeddings", len(result.get("data", [])))

@@ -38,13 +38,13 @@ from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 REQUEST_TOTAL = Counter(
     "gateway_requests_total",
     "Total chat completion requests",
-    ["model", "status"],          # status: 200 | 502 | 503 | …
+    ["model", "status", "runtime_type"],   # runtime_type: gpu | cpu
 )
 
 REQUEST_LATENCY = Histogram(
     "gateway_request_latency_seconds",
     "End-to-end request latency in seconds",
-    ["model"],
+    ["model", "runtime_type"],
     buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
 )
 
@@ -56,13 +56,25 @@ IN_FLIGHT = Gauge(
 ERRORS_TOTAL = Counter(
     "gateway_errors_total",
     "Total request errors by type",
-    ["model", "error_type"],      # error_type: upstream | ensure | timeout | …
+    ["model", "error_type", "runtime_type"],
 )
 
 ROUTING_DECISIONS_TOTAL = Counter(
     "gateway_routing_decisions_total",
     "Instance selections made by the router",
     ["instance", "strategy"],
+)
+
+CIRCUIT_BREAKER_STATE = Gauge(
+    "gateway_circuit_breaker_state",
+    "Circuit breaker state per instance (0=CLOSED 1=HALF_OPEN 2=OPEN)",
+    ["instance"],
+)
+
+INSTANCE_EWMA_LATENCY_MS = Gauge(
+    "gateway_instance_ewma_latency_ms",
+    "Per-instance EWMA latency in milliseconds",
+    ["instance"],
 )
 
 # ASGI sub-app that serves Prometheus text format on /metrics

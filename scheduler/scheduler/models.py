@@ -63,6 +63,13 @@ class Node(BaseModel):
     last_heartbeat: float = Field(default_factory=time.time)
     state: NodeState = NodeState.HEALTHY
 
+    # CPU capability — reported by Node Agent on heartbeat.
+    # has_gpu=False nodes can only serve CPU (GGUF) models.
+    # has_gpu=True nodes can serve both GPU and CPU models.
+    has_gpu: bool = True        # backward-compat: existing nodes are GPU nodes
+    cpu_cores: int = 0          # logical CPU cores available for inference
+    cpu_load: float = 0.0       # 0.0–1.0, reported by Node Agent
+
     @property
     def total_free_mb(self) -> int:
         """Sum of free GPU memory across all GPUs on this node."""
@@ -71,6 +78,14 @@ class Node(BaseModel):
     @property
     def gpu_count(self) -> int:
         return len(self.gpus)
+
+    @property
+    def can_serve_gpu(self) -> bool:
+        return self.has_gpu and len(self.gpus) > 0
+
+    @property
+    def can_serve_cpu(self) -> bool:
+        return self.cpu_cores > 0
 
 
 # ---------------------------------------------------------------------------
@@ -95,9 +110,11 @@ class RuntimeInstance(BaseModel):
     node_id: str
     agent_url: str      # Node Agent URL (for management ops)
     api_base: str       # inference endpoint including /v1
-    gpu: str            # GPU index on the node
+    gpu: str            # GPU index on the node ("" for CPU instances)
     state: str = "READY"
     placed_at: float = Field(default_factory=time.time)
+    # Which backend is serving this instance
+    runtime_type: str = "gpu"   # "gpu" | "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +150,16 @@ class HeartbeatPayload(BaseModel):
     agent_url: str
     hostname: str = ""
     gpus: list[GpuInfo] = Field(default_factory=list)
+    # CPU capability fields — omitted by older agents (backward-compatible)
+    has_gpu: bool = True
+    cpu_cores: int = 0
+    cpu_load: float = 0.0
 
 
 class EnsureRequest(BaseModel):
     model: str
+    # Optional hint: "gpu" | "cpu" | "auto" (default "auto" = let scheduler decide)
+    runtime_preference: str = "auto"
 
 
 class EnsureResponse(BaseModel):
@@ -152,6 +175,7 @@ class EnsureResponse(BaseModel):
     model_alias: str
     api_base: str                           # primary instance — backward compat
     instances: list[RuntimeInstance] = Field(default_factory=list)
+    runtime_type: str = "gpu"               # "gpu" | "cpu" — propagated to gateway
 
 
 class StopRequest(BaseModel):

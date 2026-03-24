@@ -54,6 +54,20 @@ class Settings(BaseSettings):
     # 0 = always ask the Scheduler (safest); >0 = cache in memory (faster).
     placement_cache_ttl_sec: float = 30.0
 
+    # --- CPU / GPU hybrid routing ---
+    # Comma-separated map of GPU model → CPU variant.
+    # Format: "gpu_model_id:cpu_model_id,..."
+    # Example: "mistral-7b-instruct:mistral-7b-gguf,llama3-8b:llama3-8b-gguf"
+    cpu_model_map: str = ""
+
+    # Requests with max_tokens <= this threshold are eligible for CPU routing
+    # when runtime_preference="auto". 0 = disable auto-CPU routing.
+    cpu_routing_max_tokens_threshold: int = 300
+
+    # When True, streaming requests are always sent to GPU regardless of
+    # runtime_preference="auto" (CPU latency is too high for real-time SSE).
+    cpu_routing_block_streaming: bool = True
+
     # --- Observability ---
     # OTel OTLP/gRPC endpoint (e.g. "http://jaeger:4317").
     # Empty string disables tracing.

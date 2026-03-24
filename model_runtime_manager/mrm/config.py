@@ -32,6 +32,17 @@ class ModelSpec(BaseModel):
     shm_size: str = "8gb"
     health_path: str = "/health"
 
+    # --- Hybrid runtime extension ---
+    # "gpu" → vLLM container (existing behaviour, default)
+    # "cpu" → cpu_runtime container (llama.cpp / GGUF)
+    runtime: str = "gpu"
+
+    # CPU-specific: path to GGUF file inside the mounted models volume
+    gguf_path: str = ""
+    # CPU resources allocated to the container
+    cpu_cores: int = 4       # passed as CPU_RUNTIME_N_THREADS
+    memory_mb: int = 6144    # container memory limit in MiB
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MRM_", env_file=".env", extra="ignore")
@@ -53,6 +64,15 @@ class Settings(BaseSettings):
     litellm_container_name: str = "dev_litellm"
     litellm_autowrite: bool = True
     litellm_restart_on_write: bool = False
+
+    # ── CPU auto-fallback ──────────────────────────────────────────────
+    # When set, MRM will redirect to this URL instead of failing if
+    # the Docker nvidia runtime is unavailable (LITE / no-GPU mode).
+    # Example: "http://cpu_runtime:8090"
+    auto_fallback_cpu_url: str = ""
+    # The model alias reported when serving via the CPU fallback.
+    # Should match CPU_RUNTIME_MODEL_ALIAS env var of the cpu_runtime container.
+    auto_fallback_cpu_alias: str = "cpu-model"
 
     def get_lora_host_path(self) -> str:
         """

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Request
+from fastapi.responses import Response
 
 from scheduler.models import HeartbeatPayload, NodeSummary
 
@@ -18,7 +19,8 @@ router = APIRouter()
 
 
 @router.post("/heartbeat", status_code=204, tags=["Nodes"],
-             summary="Receive a heartbeat from a Node Agent")
+             summary="Receive a heartbeat from a Node Agent",
+             response_model=None, response_class=Response)
 async def heartbeat(payload: HeartbeatPayload, request: Request) -> None:
     """
     Called by every Node Agent on a fixed interval (default 15s).

@@ -36,6 +36,7 @@ _HOP_BY_HOP = frozenset(
         "transfer-encoding",
         "upgrade",
         "host",
+        "content-length",  # httpx sets this from the re-serialized body
     }
 )
 

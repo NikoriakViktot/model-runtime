@@ -47,6 +47,8 @@ class EnsureResult:
     # Multi-instance: one element for current MRM; multiple when MRM
     # returns an ``instances`` array.  Always non-empty.
     instances: list[InstanceInfo] = field(default_factory=list)
+    # Which backend served this ensure: "gpu" (vLLM) or "cpu" (llama.cpp)
+    runtime_type: str = "gpu"
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> EnsureResult:
@@ -68,6 +70,7 @@ class EnsureResult:
             gpu=gpu,
             state=d.get("state", "READY"),
             instances=instances,
+            runtime_type=d.get("runtime_type", "gpu"),
         )
 
 

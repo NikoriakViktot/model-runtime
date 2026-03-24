@@ -145,7 +145,23 @@ class SchedulerClient:
             gpu=instances[0].gpu if instances else "",
             state="READY",
             instances=instances,
+            runtime_type=d.get("runtime_type", "gpu"),
         )
+
+    async def health(self) -> dict:
+        """
+        GET /health on the Scheduler.  Returns ``{"ok": True}`` on success.
+        Never raises — callers use the return value to determine readiness.
+        """
+        if self._http is None:
+            return {"ok": False, "reason": "scheduler client not initialised"}
+        try:
+            resp = await self._http.get("/health", timeout=5.0)
+            if resp.status_code < 500:
+                return {"ok": True, "scheduler": str(self._http.base_url)}
+            return {"ok": False, "reason": f"scheduler returned {resp.status_code}"}
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
 
     def _assert_ready(self) -> None:
         if self._http is None:

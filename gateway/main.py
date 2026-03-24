@@ -19,6 +19,8 @@ Starting the server
 
 from __future__ import annotations
 
+import asyncio
+import signal
 import time
 from contextlib import asynccontextmanager
 
@@ -48,6 +50,12 @@ setup_logging(settings.otel_service_name)
 
 log = structlog.get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Shutdown / in-flight tracking
+# ---------------------------------------------------------------------------
+_gw_shutting_down: bool = False
+_gw_in_flight: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -56,6 +64,23 @@ log = structlog.get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _gw_shutting_down, _gw_in_flight
+    _gw_shutting_down = False
+    _gw_in_flight = 0
+
+    loop = asyncio.get_running_loop()
+
+    def _on_shutdown():
+        global _gw_shutting_down
+        _gw_shutting_down = True
+        log.info("shutdown_signal_received", service="gateway")
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _on_shutdown)
+        loop.add_signal_handler(signal.SIGINT, _on_shutdown)
+    except (NotImplementedError, OSError):
+        pass
+
     mode = "distributed (Scheduler)" if settings.use_scheduler else "single-node (MRM)"
     log.info("gateway_starting", mode=mode)
 
@@ -93,6 +118,21 @@ async def lifespan(app: FastAPI):
     )
 
     yield
+
+    _gw_shutting_down = True
+    log.info("shutdown_started", service="gateway")
+
+    timeout = settings.shutdown_timeout_sec
+    t_start = loop.time()
+    while _gw_in_flight > 0:
+        elapsed = loop.time() - t_start
+        if elapsed >= timeout:
+            log.warning("shutdown_drain_timeout", in_flight=_gw_in_flight, timeout_sec=timeout)
+            break
+        log.info("waiting_for_requests", in_flight=_gw_in_flight)
+        await asyncio.sleep(1.0)
+
+    log.info("shutdown_complete", in_flight=_gw_in_flight, service="gateway")
 
     log.info("gateway_stopping")
     if settings.use_scheduler:
@@ -142,19 +182,29 @@ app.add_middleware(
 
 @app.middleware("http")
 async def observability_middleware(request: Request, call_next):
-    """
-    Per-request observability:
-      - Generate / propagate X-Request-ID
-      - Bind request_id to structlog context vars (async-safe per-coroutine)
-      - Track in-flight Prometheus gauge
-      - Emit a structured log line for every request
-    """
+    global _gw_in_flight
+
+    # Fast-path rejects — before consuming any request body
+    if _gw_shutting_down:
+        from fastapi.responses import JSONResponse as _JR
+        return _JR(status_code=503, content={"detail": "Service is shutting down."})
+
+    if settings.max_in_flight > 0 and _gw_in_flight >= settings.max_in_flight:
+        from fastapi.responses import JSONResponse as _JR
+        return _JR(
+            status_code=503,
+            content={
+                "detail": f"Gateway overloaded: {_gw_in_flight}/{settings.max_in_flight} requests in flight."
+            },
+        )
+
     request_id = request.headers.get("x-request-id") or new_request_id()
     request.state.request_id = request_id
 
     _ctxvars.clear_contextvars()
     _ctxvars.bind_contextvars(request_id=request_id, path=request.url.path)
 
+    _gw_in_flight += 1
     IN_FLIGHT.inc()
     t0 = time.perf_counter()
     request.state.t0 = t0
@@ -162,6 +212,7 @@ async def observability_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
     finally:
+        _gw_in_flight -= 1
         IN_FLIGHT.dec()
 
     latency_ms = (time.perf_counter() - t0) * 1000

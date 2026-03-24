@@ -1,0 +1,189 @@
+# docker-compose.lite.yml
+#
+# LITE stack — runs on ANY machine, GPU optional.
+#
+# PRINCIPLE: this file NEVER uses "runtime: nvidia".
+#            GPU support is added via docker-compose.gpu.yml overlay.
+#
+# Usage:
+#   CPU-only:         docker compose -f docker-compose.lite.yml up
+#   With GPU:         docker compose -f docker-compose.lite.yml -f docker-compose.gpu.yml up
+#
+# Prerequisites:
+#   1. Copy .env.lite to .env and fill HF_TOKEN (optional) + GGUF_MODELS_PATH
+#   2. Build the cpu_runtime image:
+#        docker build -t model-runtime-cpu:latest ./cpu_runtime
+#   3. Place a GGUF model at ${GGUF_MODELS_PATH}/model.gguf
+#      (e.g. hf_cache/gguf/model.gguf)
+#      Download: huggingface-cli download bartowski/Qwen2.5-1.5B-Instruct-GGUF \
+#                  Qwen2.5-1.5B-Instruct-Q4_K_M.gguf --local-dir ./hf_cache/gguf \
+#                  --local-dir-use-symlinks False && \
+#                mv ./hf_cache/gguf/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf ./hf_cache/gguf/model.gguf
+
+version: "3.9"
+
+networks:
+  ai_net:
+    name: ai_net_lite
+    driver: bridge
+
+services:
+
+  # ── Redis — MRM state store ────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: lite_redis
+    # No persistence — lite stack is ephemeral
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ai_net]
+    restart: unless-stopped
+
+  # ── CPU Inference Runtime (llama.cpp / GGUF) ───────────────────────
+  # Always on in LITE mode. The gateway routes here when GPU is absent.
+  # Build once: docker build -t model-runtime-cpu:latest ./cpu_runtime
+  cpu_runtime:
+    image: model-runtime-cpu:latest
+    container_name: lite_cpu_runtime
+    command: uvicorn cpu_runtime.app:app --host 0.0.0.0 --port 8090
+    ports:
+      - "8090:8090"
+    environment:
+      # Path to the GGUF model file INSIDE the container (mounted below)
+      CPU_RUNTIME_MODEL_PATH: /models/model.gguf
+      # Alias used in /v1/models and returned to the gateway
+      CPU_RUNTIME_MODEL_ALIAS: ${CPU_MODEL_ALIAS:-cpu-model}
+      # Use ≤ 4 threads on low-resource machines
+      CPU_RUNTIME_N_THREADS: ${CPU_THREADS:-2}
+      # Small context = lower RAM usage
+      CPU_RUNTIME_N_CTX: ${CPU_N_CTX:-2048}
+      CPU_RUNTIME_MAX_TOKENS_DEFAULT: "256"
+      LOG_FORMAT: "json"
+    volumes:
+      # Host directory that contains model.gguf (read-only)
+      - ${GGUF_MODELS_PATH:-./hf_cache/gguf}:/models:ro
+    healthcheck:
+      # Pure Python probe — no curl needed
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # GGUF loading can take 30–120 s on slow hardware
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_CORES_LIMIT:-4}"
+          memory: "${CPU_MEM_LIMIT:-6G}"
+    networks: [ai_net]
+    restart: unless-stopped
+
+  # ── Model Runtime Manager ──────────────────────────────────────────
+  # NO "runtime: nvidia" here — MRM manages containers but doesn't need GPU itself.
+  # GPU support is added via docker-compose.gpu.yml overlay.
+  model_runtime_manager:
+    build: ./model_runtime_manager
+    container_name: lite_mrm
+    command: uvicorn mrm.app:app --host 0.0.0.0 --port 8010
+    ports:
+      - "8010:8010"
+    environment:
+      MRM_REDIS_URL: redis://redis:6379/2
+      MRM_DOCKER_NETWORK: ai_net_lite
+      MRM_IDLE_TIMEOUT_SEC: "1800"
+      MRM_SWEEP_INTERVAL_SEC: "60"
+      MRM_HEALTH_TIMEOUT_SEC: "600"
+      MRM_KEEP_FAILED_CONTAINERS: "0"
+      MRM_ARTIFACTS_HOST_PATH: ${PWD}/artifacts
+      MRM_HF_CACHE_HOST_PATH: ${PWD}/hf_cache
+      # LITE-specific: when GPU unavailable, MRM redirects to cpu_runtime
+      MRM_AUTO_FALLBACK_CPU_URL: http://cpu_runtime:8090
+      MRM_AUTO_FALLBACK_CPU_ALIAS: ${CPU_MODEL_ALIAS:-cpu-model}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./artifacts:/artifacts
+      - ./hf_cache:/app_host/hf_cache
+    depends_on:
+      redis:
+        condition: service_healthy
+      cpu_runtime:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8010/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks: [ai_net]
+    restart: unless-stopped
+
+  # ── API Gateway ────────────────────────────────────────────────────
+  gateway:
+    build: ./gateway
+    container_name: lite_gateway
+    command: uvicorn gateway.main:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_MRM_URL: http://model_runtime_manager:8010
+      GATEWAY_USE_SCHEDULER: "false"
+      GATEWAY_MLFLOW_ENABLED: "false"
+      GATEWAY_AUTO_PROVISION: "false"
+      # Map GPU model IDs to their CPU GGUF equivalents.
+      # Format: "gpu-model-id:cpu-alias,..."
+      # Example: "Qwen/Qwen1.5-1.8B-Chat:cpu-model"
+      GATEWAY_CPU_MODEL_MAP: ${GATEWAY_CPU_MODEL_MAP:-}
+      # In LITE mode, prefer CPU for short requests (auto-routing).
+      # Set to 0 to disable CPU auto-routing (manual via runtime_preference).
+      # Set to 99999 to always use CPU.
+      GATEWAY_CPU_ROUTING_MAX_TOKENS_THRESHOLD: ${CPU_ROUTING_THRESHOLD:-300}
+      # Block streaming on CPU runtime (slower, may timeout)
+      GATEWAY_CPU_ROUTING_BLOCK_STREAMING: "false"
+      LOG_FORMAT: "json"
+    depends_on:
+      model_runtime_manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [ai_net]
+    restart: unless-stopped
+
+  # ── Frontend (optional — comment out to save RAM) ──────────────────
+  frontend:
+    build: ./frontend
+    container_name: lite_frontend
+    command: streamlit run ui/app.py --server.port=8502 --server.address=0.0.0.0
+    ports:
+      - "8502:8502"
+    environment:
+      GATEWAY_URL: http://gateway:8080
+      MRM_URL: http://model_runtime_manager:8010
+      SCHEDULER_URL: ""
+      CONTROL_PLANE_URL: ""
+      PROMETHEUS_URL: ""
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8502/_stcore/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: "512M"
+    networks: [ai_net]
+    restart: unless-stopped
+    profiles: [ui]    # opt-in: docker compose --profile ui up

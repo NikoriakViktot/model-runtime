@@ -117,6 +117,48 @@ services:
     networks: [ai_net]
 
   # ===============================
+  # CPU INFERENCE RUNTIME (llama.cpp / GGUF)
+  # ===============================
+  # Serves GGUF-quantized models (e.g. Mistral-7B Q4_K_M) on CPU.
+  # Mount a GGUF file to /models/model.gguf and set CPU_RUNTIME_MODEL_ALIAS.
+  #
+  # To enable: set a GATEWAY_CPU_MODEL_MAP entry, e.g.:
+  #   GATEWAY_CPU_MODEL_MAP=mistral-7b-instruct:mistral-7b-gguf
+  #
+  # Build the image first:
+  #   docker build -t model-runtime-cpu:latest ./cpu_runtime
+  #
+  cpu_runtime:
+    image: model-runtime-cpu:latest
+    container_name: dev_cpu_runtime
+    command: uvicorn cpu_runtime.app:app --host 0.0.0.0 --port 8090
+    ports:
+      - "8090:8090"
+    environment:
+      CPU_RUNTIME_MODEL_PATH: /models/model.gguf
+      CPU_RUNTIME_MODEL_ALIAS: ${CPU_MODEL_ALIAS:-mistral-7b-gguf}
+      CPU_RUNTIME_N_THREADS: "4"
+      CPU_RUNTIME_N_CTX: "4096"
+      CPU_RUNTIME_MAX_TOKENS_DEFAULT: "512"
+      LOG_FORMAT: "json"
+    volumes:
+      # Mount directory containing your GGUF file as /models
+      - ${GGUF_MODELS_PATH:-./hf_cache/gguf}:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s    # GGUF loading can take 30–90s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: "6G"
+    networks: [ai_net]
+    profiles: [cpu]    # opt-in: start with `docker compose --profile cpu up`
+
+  # ===============================
   # EMBEDDINGS API
   # ===============================
 
@@ -188,9 +230,9 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8030/health"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8030/health')\""]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 10
       start_period: 5s
     networks: [ai_net]
@@ -221,9 +263,9 @@ services:
       scheduler:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8020/health"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8020/health')\""]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 10
       start_period: 5s
     networks: [ai_net]
@@ -251,13 +293,20 @@ services:
       GATEWAY_OTEL_ENDPOINT: "http://jaeger:4317"
       GATEWAY_OTEL_SERVICE_NAME: "gateway"
       LOG_FORMAT: "json"
+      # CPU routing: map GPU model IDs to their CPU (GGUF) variants.
+      # Format: "gpu-model-id:cpu-model-id,..."
+      # Example with a registered GGUF model:
+      #   GATEWAY_CPU_MODEL_MAP=mistral-7b-instruct:mistral-7b-gguf
+      GATEWAY_CPU_MODEL_MAP: ${GATEWAY_CPU_MODEL_MAP:-}
+      # Requests with max_tokens <= this value are eligible for CPU routing (auto mode)
+      GATEWAY_CPU_ROUTING_MAX_TOKENS_THRESHOLD: "300"
     depends_on:
       model_runtime_manager:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 10
       start_period: 5s
     networks: [ai_net]
@@ -270,15 +319,23 @@ services:
     build: ./frontend
     container_name: dev_frontend
     command: streamlit run ui/app_2.py --server.port=8502 --server.address=0.0.0.0 --server.baseUrlPath=/ui
+    ports:
+      - "8502:8502"
     environment:
       CONTROL_PLANE_URL: http://control_plane:8004
       GATEWAY_URL: http://gateway:8080
+      MRM_URL: http://model_runtime_manager:8010
+      PROMETHEUS_URL: http://prometheus:9090
+      JAEGER_UI_URL: http://localhost:16686
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
       AWS_BUCKET_NAME: ${AWS_S3_BUCKET}
     volumes:
       - ./artifacts:/artifacts
+    depends_on:
+      model_runtime_manager:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8502/ui/_stcore/health || exit 1"]
       interval: 10s

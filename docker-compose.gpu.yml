@@ -1,0 +1,33 @@
+# docker-compose.gpu.yml
+#
+# GPU overlay for docker-compose.lite.yml.
+# Adds NVIDIA runtime to MRM so it can spawn vLLM containers on GPU.
+#
+# Usage:
+#   docker compose -f docker-compose.lite.yml -f docker-compose.gpu.yml up
+#
+# Prerequisites:
+#   - NVIDIA driver installed on the host
+#   - nvidia-container-toolkit installed:
+#       https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#   - Verify: docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
+
+services:
+
+  model_runtime_manager:
+    # Enable NVIDIA runtime so MRM can spawn vLLM GPU containers
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # With GPU available, reduce CPU fallback threshold (300 tokens → use GPU for long requests)
+      MRM_AUTO_FALLBACK_CPU_URL: ""   # disable CPU fallback — GPU is present
+
+  gateway:
+    environment:
+      # With GPU enabled, only route very short requests to CPU (or disable CPU routing)
+      GATEWAY_CPU_ROUTING_MAX_TOKENS_THRESHOLD: "300"
+
+  # vLLM containers will be spawned dynamically by MRM.
+  # They inherit the nvidia runtime from the Docker socket config.
+  # No need to declare them here — MRM manages their lifecycle.

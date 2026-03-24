@@ -47,5 +47,26 @@ class Settings(BaseSettings):
     # Queue: max concurrent inference requests (llama.cpp is single-threaded)
     max_queue_depth: int = 16
 
+    # Timeouts
+    # Maximum wall-clock seconds allowed for a single generation call.
+    # 0 = disabled (no timeout).  504 is returned when exceeded.
+    generation_timeout_sec: float = 120.0
+
+    # Request validation guardrails
+    # Maximum total character count across all message content fields.
+    # Requests exceeding this limit are rejected with HTTP 413.
+    max_prompt_chars: int = 32768       # 32 KiB — sane default for llama.cpp
+    # Maximum value allowed in the request "max_tokens" field.
+    # Requests exceeding this are clamped, not rejected.
+    max_total_tokens: int = 4096
+
+    # Startup memory guard
+    # Minimum free system RAM (MiB) at startup.  A warning is logged if RAM
+    # falls below this threshold; readiness probe reflects the warning.
+    min_free_ram_mb: int = 512
+
+    # CORS: comma-separated list of allowed origins, or "*" to allow all
+    cors_origins: str = "*"
+
 
 settings = Settings()

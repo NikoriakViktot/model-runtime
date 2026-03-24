@@ -17,6 +17,7 @@ Starting the server
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import structlog
@@ -35,12 +36,40 @@ log = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Startup helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_free_ram_mb() -> int:
+    """Return free RAM in MiB, or -1 if unavailable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return -1
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # --- RAM guard ---
+    free_mb = _check_free_ram_mb()
+    if free_mb >= 0 and free_mb < settings.min_free_ram_mb:
+        log.warning(
+            "cpu_runtime_low_ram",
+            free_mb=free_mb,
+            min_free_mb=settings.min_free_ram_mb,
+        )
+    elif free_mb >= 0:
+        log.info("cpu_runtime_ram_ok", free_mb=free_mb)
+
     log.info(
         "cpu_runtime_starting",
         model_path=settings.model_path,
@@ -49,18 +78,32 @@ async def lifespan(app: FastAPI):
         n_threads=settings.n_threads,
     )
 
+    # --- Model load (non-fatal: service stays up to return proper 503/ready) ---
+    _inference_module.load_state = "loading"
     engine = LlamaCppEngine(settings)
-    await engine.load()
-
-    # Expose via module-level so the route can call get_engine()
-    _inference_module.engine = engine
-
-    log.info("cpu_runtime_ready", model_alias=settings.model_alias)
+    try:
+        if not os.path.exists(settings.model_path):
+            raise FileNotFoundError(
+                f"GGUF model not found at {settings.model_path!r}"
+            )
+        await engine.load()
+        _inference_module.engine = engine
+        _inference_module.load_state = "loaded"
+        log.info("cpu_runtime_ready", model_alias=settings.model_alias)
+    except FileNotFoundError as exc:
+        _inference_module.load_state = "not_found"
+        _inference_module.load_error = str(exc)
+        log.error("cpu_runtime_model_not_found", error=str(exc))
+    except Exception as exc:
+        _inference_module.load_state = "failed"
+        _inference_module.load_error = str(exc)
+        log.error("cpu_runtime_load_failed", error=str(exc))
 
     yield
 
     log.info("cpu_runtime_stopping")
-    await engine.unload()
+    if _inference_module.engine is not None:
+        await engine.unload()
     log.info("cpu_runtime_stopped")
 
 
@@ -80,9 +123,14 @@ app = FastAPI(
 
 app.mount("/metrics", metrics_app)
 
+_cors_origins = (
+    [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    if settings.cors_origins != "*"
+    else ["*"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -97,10 +145,29 @@ app.include_router(chat.router, tags=["Chat"])
 
 @app.get("/health", tags=["Operations"])
 async def health():
-    """Liveness probe. Returns 200 once the model is loaded."""
-    if _inference_module.engine is None:
-        return JSONResponse(status_code=503, content={"status": "loading"})
-    return {"status": "ok", "model": settings.model_alias}
+    """Liveness probe. Always returns 200 — confirms the process is alive."""
+    return {"status": "ok"}
+
+
+@app.get("/ready", tags=["Operations"])
+async def ready():
+    """Readiness probe. Returns 200 only when the model is fully loaded."""
+    state = _inference_module.load_state
+    if state == "loaded":
+        return {"status": "ready", "model": settings.model_alias}
+    if state in ("not_found", "failed"):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": state,
+                "error": _inference_module.load_error,
+            },
+        )
+    # "loading" or "not_started"
+    return JSONResponse(
+        status_code=503,
+        content={"status": state},
+    )
 
 
 @app.get("/v1/models", tags=["Models"])
@@ -127,6 +194,7 @@ async def root():
         "model": settings.model_alias,
         "runtime": "llama.cpp",
         "health": "/health",
+        "ready": "/ready",
         "metrics": "/metrics",
         "docs": "/docs",
     }

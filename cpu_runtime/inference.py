@@ -150,7 +150,9 @@ class LlamaCppEngine:
     # Streaming generation
     # ------------------------------------------------------------------
 
-    async def stream(self, req: GenerationRequest) -> AsyncIterator[bytes]:
+    async def stream(
+        self, req: GenerationRequest, timeout_sec: float | None = None
+    ) -> AsyncIterator[bytes]:
         """
         Yield SSE-formatted bytes as tokens are generated.
 
@@ -178,6 +180,8 @@ class LlamaCppEngine:
         # Queue capacity = max_tokens + 2 (sentinel + safety).  Bounded to
         # avoid unbounded memory growth on slow consumers.
         q: asyncio.Queue = asyncio.Queue(maxsize=req.max_tokens + 2)
+        # Compute an absolute deadline so remaining time shrinks as we iterate.
+        _deadline: float | None = (loop.time() + timeout_sec) if timeout_sec else None
 
         def _produce() -> None:
             """Run entirely in a thread — never touches the event loop."""
@@ -207,7 +211,15 @@ class LlamaCppEngine:
 
             try:
                 while True:
-                    item = await q.get()
+                    if _deadline is not None:
+                        remaining = _deadline - loop.time()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError(
+                                f"Stream generation timed out after {timeout_sec:.0f}s"
+                            )
+                        item = await asyncio.wait_for(q.get(), timeout=remaining)
+                    else:
+                        item = await q.get()
                     if item is None:
                         # Sentinel: generator exhausted normally
                         yield b"data: [DONE]\n\n"
@@ -288,6 +300,11 @@ class LlamaCppEngine:
 # ---------------------------------------------------------------------------
 
 engine: LlamaCppEngine | None = None
+
+# Loading state — set by the app lifespan (app.py).
+# "not_started" | "loading" | "loaded" | "failed" | "not_found"
+load_state: str = "not_started"
+load_error: str = ""
 
 
 def get_engine() -> LlamaCppEngine:

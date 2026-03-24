@@ -2,9 +2,9 @@
 from typing import Type
 from pydantic import BaseModel
 
-from domain.contracts.dataset_build_v1 import DatasetBuildPayloadV1
+from control_plane.domain.contracts.dataset_build_v1 import DatasetBuildPayloadV1
 from .train_qlora_v1 import TrainQLoRAPayloadV1
-from domain.contracts.train_dpo_v1 import TrainDPOPayloadV1
+from control_plane.domain.contracts.train_dpo_v1 import TrainDPOPayloadV1
 from .eval_standard_v1 import EvalStandardPayloadV1
 
 CONTRACT_REGISTRY: dict[str, Type[BaseModel]] = {

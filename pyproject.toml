@@ -9,6 +9,7 @@ markers = [
     "concurrency: concurrent-load tests — thundering herd, isolation, deadlock detection",
     "slow: tests that take >5s by design (skip in fast feedback loops with '-m not slow')",
     "chaos: chaos engineering tests — probabilistic failures, mixed workloads",
+    "slo: service level objective validation — latency bounds, error rate budgets, regression gates",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

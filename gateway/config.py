@@ -83,6 +83,22 @@ class Settings(BaseSettings):
     # CORS: comma-separated list of allowed origins, or "*" to allow all
     cors_origins: str = "*"
 
+    # --- Retry ---
+    # Maximum number of extra attempts on retryable upstream errors (503/504).
+    # 0 = no retries.
+    retry_max: int = 1
+    retry_jitter_min_ms: int = 50
+    retry_jitter_max_ms: int = 150
+
+    # --- Graceful shutdown ---
+    # Maximum seconds to wait for in-flight requests during shutdown.
+    shutdown_timeout_sec: float = 30.0
+
+    # --- Gateway-level load shedding ---
+    # Reject new requests at the gateway if concurrent count exceeds this.
+    # 0 = disabled.
+    max_in_flight: int = 50
+
     # --- Observability ---
     # OTel OTLP/gRPC endpoint (e.g. "http://jaeger:4317").
     # Empty string disables tracing.

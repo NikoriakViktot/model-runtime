@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # Inference proxy: large models can produce long completions.
     proxy_timeout: float = 300.0
 
+    # Separate connect / read timeouts for the inference proxy.
+    # connect_timeout: TCP handshake + TLS, should be short.
+    # read_timeout: per-read timeout; for SSE streams this is between chunks.
+    connect_timeout: float = 5.0
+    read_timeout: float = 300.0
+
     # --- Auto-provision ---
     # If True and a model is not yet in the MRM registry, the gateway will
     # attempt to register it from HuggingFace before ensuring.
@@ -67,6 +73,15 @@ class Settings(BaseSettings):
     # When True, streaming requests are always sent to GPU regardless of
     # runtime_preference="auto" (CPU latency is too high for real-time SSE).
     cpu_routing_block_streaming: bool = True
+
+    # --- Circuit breaker (CPU runtime) ---
+    # Number of consecutive errors before the circuit opens.
+    cpu_cb_failure_threshold: int = 5
+    # Seconds to wait in OPEN state before probing again (HALF_OPEN).
+    cpu_cb_reset_timeout_sec: float = 30.0
+
+    # CORS: comma-separated list of allowed origins, or "*" to allow all
+    cors_origins: str = "*"
 
     # --- Observability ---
     # OTel OTLP/gRPC endpoint (e.g. "http://jaeger:4317").

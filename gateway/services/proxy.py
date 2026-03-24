@@ -62,19 +62,35 @@ class ProxyService:
     def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
 
-    async def setup(self, timeout: float) -> None:
-        """Open the underlying httpx connection pool."""
+    async def setup(
+        self,
+        timeout: float = 300.0,
+        connect_timeout: float = 5.0,
+        read_timeout: float | None = None,
+    ) -> None:
+        """Open the underlying httpx connection pool.
+
+        Args:
+            timeout:         Fallback read timeout (used when read_timeout is not given).
+            connect_timeout: TCP connect + TLS timeout (should be short).
+            read_timeout:    Per-read timeout for the stream; defaults to ``timeout``.
+        """
+        _read = read_timeout if read_timeout is not None else timeout
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(
-                connect=10.0,
-                read=timeout,
+                connect=connect_timeout,
+                read=_read,
                 write=30.0,
                 pool=10.0,
             ),
             # Follow redirects from upstream (e.g. litellm → vllm)
             follow_redirects=True,
         )
-        logger.info("Proxy service ready (timeout=%.0fs)", timeout)
+        logger.info(
+            "Proxy service ready (connect=%.0fs read=%.0fs)",
+            connect_timeout,
+            _read,
+        )
 
     async def teardown(self) -> None:
         """Close the connection pool."""

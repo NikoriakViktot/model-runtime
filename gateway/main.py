@@ -73,7 +73,11 @@ async def lifespan(app: FastAPI):
             base_url=settings.mrm_url,
             ensure_timeout=settings.mrm_ensure_timeout,
         )
-    await proxy.setup(timeout=settings.proxy_timeout)
+    await proxy.setup(
+        timeout=settings.proxy_timeout,
+        connect_timeout=settings.connect_timeout,
+        read_timeout=settings.read_timeout,
+    )
 
     if settings.mlflow_enabled:
         mlflow_logger.setup(
@@ -123,9 +127,14 @@ app.mount("/metrics", metrics_app)
 # Middleware
 # ---------------------------------------------------------------------------
 
+_cors_origins = (
+    [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    if settings.cors_origins != "*"
+    else ["*"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

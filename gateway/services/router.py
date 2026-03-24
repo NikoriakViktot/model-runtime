@@ -710,4 +710,8 @@ def _make_strategy(name: str) -> RoutingStrategy:
 
 
 #: Module-level singleton.  Import and use directly in routes.
-model_router = ModelRouter(strategy=_make_strategy(settings.routing_strategy))
+model_router = ModelRouter(
+    strategy=_make_strategy(settings.routing_strategy),
+    circuit_error_threshold=settings.cpu_cb_failure_threshold,
+    circuit_cooldown_sec=settings.cpu_cb_reset_timeout_sec,
+)

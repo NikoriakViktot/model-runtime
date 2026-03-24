@@ -157,62 +157,88 @@ class LlamaCppEngine:
         Each yielded chunk is a complete ``data: {...}\n\n`` SSE frame
         matching the OpenAI streaming format so the gateway can forward
         them verbatim.
+
+        Implementation note
+        -------------------
+        llama-cpp-python's streaming generator calls blocking C code for
+        every token.  We must NOT iterate it on the asyncio event loop —
+        that would block the loop for the entire response duration.
+
+        Instead, a background thread runs the full generator and puts each
+        raw chunk onto a thread-safe asyncio.Queue.  The event loop then
+        drains the queue asynchronously.  A ``None`` sentinel signals end-
+        of-stream; an ``Exception`` object signals an error.
         """
         self._assert_loaded()
 
         prompt = self._build_prompt(req.messages)
         request_id = f"chatcmpl-cpu-{int(time.time() * 1000)}"
         created = int(time.time())
+        loop = asyncio.get_running_loop()
+        # Queue capacity = max_tokens + 2 (sentinel + safety).  Bounded to
+        # avoid unbounded memory growth on slow consumers.
+        q: asyncio.Queue = asyncio.Queue(maxsize=req.max_tokens + 2)
 
-        def _run_stream():
-            return self._llm(
-                prompt,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                repeat_penalty=req.repeat_penalty,
-                stop=req.stop or ["</s>", "<|im_end|>", "<|eot_id|>"],
-                stream=True,
-            )
+        def _produce() -> None:
+            """Run entirely in a thread — never touches the event loop."""
+            try:
+                for raw_chunk in self._llm(
+                    prompt,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    repeat_penalty=req.repeat_penalty,
+                    stop=req.stop or ["</s>", "<|im_end|>", "<|eot_id|>"],
+                    stream=True,
+                ):
+                    # put_nowait is safe here because queue capacity >= max_tokens
+                    asyncio.run_coroutine_threadsafe(q.put(raw_chunk), loop).result()
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(q.put(exc), loop).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(None), loop).result()
 
-        # Acquire the semaphore BEFORE entering the generator so a second
-        # concurrent request waits here rather than interleaving with the
-        # first inside the thread.
+        # Acquire semaphore before launching the thread so a second request
+        # waits here rather than contending with the C-level generator.
         await self._sem.acquire()
         try:
-            iterator = await asyncio.to_thread(_run_stream)
+            # Launch the blocking generator in a thread pool worker.
+            producer = loop.run_in_executor(None, _produce)
 
-            async def _generate_chunks():
-                try:
-                    for chunk in iterator:
-                        delta_text = chunk["choices"][0].get("text", "")
-                        finish_reason = chunk["choices"][0].get("finish_reason")
+            try:
+                while True:
+                    item = await q.get()
+                    if item is None:
+                        # Sentinel: generator exhausted normally
+                        yield b"data: [DONE]\n\n"
+                        break
+                    if isinstance(item, Exception):
+                        raise item
 
-                        payload = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": self._settings.model_alias,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": delta_text},
-                                    "finish_reason": finish_reason,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(payload)}\n\n".encode()
+                    delta_text = item["choices"][0].get("text", "")
+                    finish_reason = item["choices"][0].get("finish_reason")
+                    payload = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": self._settings.model_alias,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": delta_text},
+                                "finish_reason": finish_reason,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n".encode()
 
-                    yield b"data: [DONE]\n\n"
-                finally:
-                    self._sem.release()
+            finally:
+                # Ensure the producer thread is drained before we release
+                # the semaphore, so the next request sees a clean state.
+                await producer
 
-            async for chunk in _generate_chunks():
-                yield chunk
-
-        except Exception:
+        finally:
             self._sem.release()
-            raise
 
     # ------------------------------------------------------------------
     # Internal

@@ -13,7 +13,7 @@ from ui.theme import apply as apply_theme
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
     page_title="Model Runtime",
-    page_icon="🧠",
+    page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded",
 )

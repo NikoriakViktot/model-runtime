@@ -267,7 +267,7 @@ jobs:
   # Resilience tests — full suite including slow tests.
   # Runs in parallel with flaky + chaos.
   # =========================================================================
-  resilience:
+  resilience_full:
     name: Resilience Tests
     runs-on: ubuntu-latest
     needs: [unit, integration]
@@ -313,7 +313,7 @@ jobs:
   report:
     name: CI Report
     runs-on: ubuntu-latest
-    needs: [resilience, flaky, chaos]
+    needs: [resilience_full, flaky, chaos]
     if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
 
     steps:

@@ -26,7 +26,6 @@ This lets clients pass a raw HuggingFace repo ID without pre-registering.
 
 from __future__ import annotations
 
-import random
 import time
 from typing import Any
 
@@ -43,7 +42,6 @@ from gateway.observability import (
     ROUTING_DECISIONS_TOTAL,
     get_tracer,
 )
-
 from gateway.services import mlflow_logger
 from gateway.services.mrm_client import (
     EnsureResult,

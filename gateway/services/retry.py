@@ -55,8 +55,9 @@ async def call_with_retry(
         The last exception when all attempts fail, or immediately for
         non-retryable errors (4xx, 429).
     """
-    from gateway.services.proxy import UpstreamError
     import httpx
+
+    from gateway.services.proxy import UpstreamError
 
     for attempt in range(1, max_retries + 2):  # up to max_retries+1 total calls
         try:

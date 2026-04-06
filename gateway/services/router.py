@@ -74,7 +74,7 @@ import logging
 import random as _random
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncIterator, Protocol, runtime_checkable
 
 from gateway.config import settings

@@ -34,7 +34,7 @@ import time
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
-from gateway.services.mrm_client import MRMUnavailableError, ModelStatus, mrm
+from gateway.services.mrm_client import ModelStatus, MRMUnavailableError, mrm
 
 logger = logging.getLogger(__name__)
 

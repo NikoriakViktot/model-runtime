@@ -191,8 +191,13 @@ async def register(req: RegisterReq):
 @app.post("/models/ensure")
 async def ensure(req: EnsureReq):
     try:
-        logger.info("Ensuring model: %s", req.base_model)
-        return await asyncio.to_thread(mrm.ensure_running, req.base_model)
+        logger.info("Ensuring model: %s profile=%s", req.base_model, req.profile)
+        return await asyncio.to_thread(
+            mrm.ensure_running,
+            req.base_model,
+            req.profile,
+            req.node_capabilities,
+        )
     except RuntimeError409 as e:
         raise HTTPException(status_code=409, detail=str(e))
 

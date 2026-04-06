@@ -188,10 +188,10 @@ def render():
         if r_slo.ok and isinstance(r_slo.data, dict):
             slo = r_slo.data
             scols = st.columns(4)
-            scols[0].metric("p50 latency",  f"{slo.get('p50_ms', 0):.0f} ms")
-            scols[1].metric("p95 latency",  f"{slo.get('p95_ms', 0):.0f} ms")
-            scols[2].metric("p99 latency",  f"{slo.get('p99_ms', 0):.0f} ms")
-            scols[3].metric("Error rate",   f"{slo.get('error_rate', 0)*100:.2f}%")
+            scols[0].metric("p50 latency",  f"{slo.get('p50_ms') or 0:.0f} ms")
+            scols[1].metric("p95 latency",  f"{slo.get('p95_ms') or 0:.0f} ms")
+            scols[2].metric("p99 latency",  f"{slo.get('p99_ms') or 0:.0f} ms")
+            scols[3].metric("Error rate",   f"{(slo.get('error_rate') or 0) * 100:.2f}%")
         else:
             st.info("SLO data unavailable.")
 

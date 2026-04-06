@@ -141,10 +141,11 @@ services:
   model_runtime_manager:
     build: ./model_runtime_manager
     container_name: lite_mrm
-    command: uvicorn mrm.app:app --host 0.0.0.0 --port 8010
+    command: uvicorn model_runtime_manager.mrm.app:app --host 0.0.0.0 --port 8010
     ports:
       - "${LITE_MRM_PORT:-8011}:8010"
     environment:
+      PYTHONPATH: /app
       MRM_REDIS_URL: redis://redis:6379/2
       MRM_DOCKER_NETWORK: ai_net_lite
       MRM_IDLE_TIMEOUT_SEC: "1800"

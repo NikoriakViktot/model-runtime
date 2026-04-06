@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_PORT=8502 \
-    STREAMLIT_SERVER_ADDRESS=0.0.0.0
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    PYTHONPATH=/app
 
 WORKDIR /app
 
@@ -31,4 +32,4 @@ EXPOSE 8502
 HEALTHCHECK CMD curl --fail http://localhost:8502/_stcore/health || exit 1
 
 # Запуск
-ENTRYPOINT ["streamlit", "run", "ui/app_2.py"]
+ENTRYPOINT ["streamlit", "run", "ui/app.py"]

@@ -71,8 +71,8 @@ _ENDPOINTS: list[dict] = [
      "desc": "GPU-aware model recommendations",
      "default_body": None, "params": {"q": "small instruct", "gpu_id": "0", "limit": "10"}, "timeout": 20},
     {"service": "MRM", "method": "POST", "path": "/models/register_from_hf",
-     "desc": "Register HF model from preset",
-     "default_body": {"repo_id": "Qwen/Qwen1.5-1.8B-Chat", "preset": "small_chat",
+     "desc": "Register HF model from HuggingFace",
+     "default_body": {"repo_id": "Qwen/Qwen1.5-1.8B-Chat",
                       "gpu": "0", "overrides": {}}, "timeout": 30},
 
     # Scheduler

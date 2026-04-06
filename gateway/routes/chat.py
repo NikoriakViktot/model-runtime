@@ -264,10 +264,10 @@ async def _ensure_via_scheduler(model: str) -> EnsureResult:
     try:
         return await scheduler_client.ensure(model)
     except SchedulerUnavailableError as exc:
-        ERRORS_TOTAL.labels(model=model, error_type="scheduler_unavailable").inc()
+        ERRORS_TOTAL.labels(model=model, error_type="scheduler_unavailable", runtime_type="unknown").inc()
         raise HTTPException(status_code=503, detail=f"Scheduler is unavailable: {exc}")
     except SchedulerError as exc:
-        ERRORS_TOTAL.labels(model=model, error_type="scheduler_error").inc()
+        ERRORS_TOTAL.labels(model=model, error_type="scheduler_error", runtime_type="unknown").inc()
         raise HTTPException(
             status_code=exc.status_code or 502,
             detail=f"Scheduler error for '{model}': {exc}",
@@ -295,21 +295,21 @@ async def _ensure_with_autoprovision(model: str) -> EnsureResult:
                 gpu=settings.default_gpu,
             )
         except MRMError as exc:
-            ERRORS_TOTAL.labels(model=model, error_type="provision_failed").inc()
+            ERRORS_TOTAL.labels(model=model, error_type="provision_failed", runtime_type="unknown").inc()
             raise HTTPException(
                 status_code=503, detail=f"Auto-provision failed for '{model}': {exc}"
             )
         try:
             return await mrm.ensure(model)
         except MRMError as exc:
-            ERRORS_TOTAL.labels(model=model, error_type="ensure_after_provision").inc()
+            ERRORS_TOTAL.labels(model=model, error_type="ensure_after_provision", runtime_type="unknown").inc()
             raise HTTPException(
                 status_code=503,
                 detail=f"Runtime unavailable for '{model}' after provision: {exc}",
             )
 
     except ModelLockedError:
-        ERRORS_TOTAL.labels(model=model, error_type="model_locked").inc()
+        ERRORS_TOTAL.labels(model=model, error_type="model_locked", runtime_type="unknown").inc()
         raise HTTPException(
             status_code=503,
             detail=f"Model '{model}' is busy with another operation. Retry shortly.",
@@ -317,13 +317,13 @@ async def _ensure_with_autoprovision(model: str) -> EnsureResult:
         )
 
     except MRMUnavailableError as exc:
-        ERRORS_TOTAL.labels(model=model, error_type="mrm_unavailable").inc()
+        ERRORS_TOTAL.labels(model=model, error_type="mrm_unavailable", runtime_type="unknown").inc()
         raise HTTPException(
             status_code=503, detail=f"Model runtime service is unavailable: {exc}"
         )
 
     except MRMError as exc:
-        ERRORS_TOTAL.labels(model=model, error_type="mrm_error").inc()
+        ERRORS_TOTAL.labels(model=model, error_type="mrm_error", runtime_type="unknown").inc()
         raise HTTPException(
             status_code=502, detail=f"MRM error for '{model}': {exc}"
         )

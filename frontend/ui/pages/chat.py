@@ -50,7 +50,7 @@ def render():
             st.rerun()
 
     # ── Chat history ──────────────────────────────────────────────────
-    for msg in S.get("messages"):
+    for msg in (S.get("messages") or []):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if "meta" in msg:

@@ -204,6 +204,60 @@ class HealthWatcher:
             except Exception as exc:
                 logger.error("[HEALTH] transition to FAILED error: %s", exc)
             self._fail_counts[base_model] = 0
+            # Stop the container so it releases GPU memory. Run in a thread
+            # so we don't block the async health-watcher loop.
+            asyncio.create_task(
+                self._stop_failed_container(base_model),
+                name=f"stop_failed_{base_model}",
+            )
+
+    async def _stop_failed_container(self, base_model: str) -> None:
+        """
+        Best-effort container stop after a model is marked FAILED.
+
+        Frees GPU memory so other models can start. Errors are logged
+        but never propagated — this is a background cleanup task.
+        """
+        spec = self._mrm.registry.get(base_model)
+        if not spec:
+            return
+        try:
+            container = await asyncio.to_thread(self._mrm._container_get, spec.container_name)
+            if container:
+                is_running = await asyncio.to_thread(self._mrm._container_is_running, container)
+                if is_running:
+                    logger.info(
+                        "[HEALTH] stopping FAILED container %s to free GPU memory",
+                        spec.container_name,
+                    )
+                    await asyncio.to_thread(self._mrm._container_stop, container, 15)
+            # Release GPU reservation — but only if no ensure() is currently
+            # holding the lock (OOM ladder may be retrying with this GPU).
+            lock_held = await asyncio.to_thread(
+                self._mrm.redis.exists, f"mrm:lock:{base_model}"
+            )
+            if lock_held:
+                logger.info(
+                    "[HEALTH] skipping GPU release for %s — ensure lock active (OOM retry in progress)",
+                    base_model,
+                )
+            else:
+                st = await asyncio.to_thread(self._mrm._get_state, base_model)
+                gpu = st.get("gpu", "")
+                if gpu:
+                    await asyncio.to_thread(self._mrm._gpu_release, gpu, base_model)
+                    await asyncio.to_thread(
+                        self._mrm._set_state, base_model, {"gpu": ""}
+                    )
+                    logger.info(
+                        "[HEALTH] released GPU %s reservation for FAILED model %s",
+                        gpu, base_model,
+                    )
+        except Exception as exc:
+            logger.error(
+                "[HEALTH] error stopping FAILED container %s: %s",
+                spec.container_name, exc,
+            )
 
     # ------------------------------------------------------------------
     # HTTP probe

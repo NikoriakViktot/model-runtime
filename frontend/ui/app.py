@@ -6,9 +6,20 @@ Sets up the sidebar navigation and routes to each page module.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure the project root (parent of ui/) is on sys.path so that
+# `from ui.*` imports resolve correctly regardless of how Streamlit
+# was launched (local run, Docker, or Streamlit Cloud).
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import streamlit as st
 
 from ui.theme import apply as apply_theme
+from ui.utils import state as S
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
@@ -19,6 +30,7 @@ st.set_page_config(
 )
 
 apply_theme()
+S.init()  # populate session-state defaults once per run (idempotent)
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 

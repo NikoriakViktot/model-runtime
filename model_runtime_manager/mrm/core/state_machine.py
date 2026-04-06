@@ -7,6 +7,7 @@ States
 ------
   STOPPED  — container not running; GPU free
   LOADING  — container starting; GPU reserved; vLLM not yet ready
+  WARMING  — OOM fallback ladder in progress (retrying with smaller config)
   RUNNING  — container healthy; serving requests
   FAILED   — container crashed or health-check timed out
 
@@ -14,7 +15,12 @@ Valid transitions
 -----------------
   STOPPED  → LOADING             (new load request)
   LOADING  → RUNNING             (health-check passed)
+  LOADING  → WARMING             (first OOM retry)
   LOADING  → FAILED              (startup timed out / crash)
+  WARMING  → WARMING             (further OOM retries)
+  WARMING  → RUNNING             (retry succeeded)
+  WARMING  → FAILED              (all retries exhausted)
+  WARMING  → STOPPED             (force-stop while warming)
   RUNNING  → STOPPED             (explicit stop)
   RUNNING  → LOADING             (reload / hot-swap)
   RUNNING  → FAILED              (runtime crash detected by health watcher)
@@ -42,6 +48,7 @@ logger = logging.getLogger("MRM.state_machine")
 class ModelState(str, Enum):
     STOPPED = "STOPPED"
     LOADING = "LOADING"
+    WARMING = "WARMING"   # OOM fallback retry in progress
     RUNNING = "RUNNING"
     FAILED  = "FAILED"
 
@@ -56,12 +63,14 @@ _LEGACY_MAP: Dict[str, ModelState] = {
     "FAILED":   ModelState.FAILED,
     "LOADING":  ModelState.LOADING,
     "RUNNING":  ModelState.RUNNING,
+    "WARMING":  ModelState.WARMING,
 }
 
 # Map ModelState → legacy Redis value (for backward compat)
 _TO_LEGACY: Dict[ModelState, str] = {
     ModelState.STOPPED: "STOPPED",
     ModelState.LOADING: "STARTING",
+    ModelState.WARMING: "WARMING",
     ModelState.RUNNING: "READY",
     ModelState.FAILED:  "FAILED",
 }
@@ -71,18 +80,23 @@ _TO_LEGACY: Dict[ModelState, str] = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 _VALID: frozenset[tuple[ModelState, ModelState]] = frozenset({
-    (ModelState.STOPPED, ModelState.LOADING),
-    (ModelState.LOADING, ModelState.RUNNING),
-    (ModelState.LOADING, ModelState.FAILED),
-    (ModelState.LOADING, ModelState.STOPPED),  # catastrophic: container gone mid-load
-    (ModelState.RUNNING, ModelState.STOPPED),
-    (ModelState.RUNNING, ModelState.LOADING),
-    (ModelState.RUNNING, ModelState.FAILED),
-    (ModelState.FAILED,  ModelState.LOADING),
-    (ModelState.FAILED,  ModelState.STOPPED),
+    (ModelState.STOPPED,  ModelState.LOADING),
+    (ModelState.LOADING,  ModelState.RUNNING),
+    (ModelState.LOADING,  ModelState.WARMING),   # first OOM retry
+    (ModelState.LOADING,  ModelState.FAILED),
+    (ModelState.LOADING,  ModelState.STOPPED),   # catastrophic: container gone mid-load
+    (ModelState.WARMING,  ModelState.WARMING),   # further OOM retries
+    (ModelState.WARMING,  ModelState.RUNNING),   # retry succeeded
+    (ModelState.WARMING,  ModelState.FAILED),    # all retries exhausted
+    (ModelState.WARMING,  ModelState.STOPPED),   # force-stop while warming
+    (ModelState.RUNNING,  ModelState.STOPPED),
+    (ModelState.RUNNING,  ModelState.LOADING),
+    (ModelState.RUNNING,  ModelState.FAILED),
+    (ModelState.FAILED,   ModelState.LOADING),
+    (ModelState.FAILED,   ModelState.STOPPED),
     # Idempotent self-transitions allowed for health updates
-    (ModelState.RUNNING, ModelState.RUNNING),
-    (ModelState.STOPPED, ModelState.STOPPED),
+    (ModelState.RUNNING,  ModelState.RUNNING),
+    (ModelState.STOPPED,  ModelState.STOPPED),
 })
 
 

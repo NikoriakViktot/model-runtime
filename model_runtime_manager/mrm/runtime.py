@@ -1,4 +1,5 @@
 # runtime.py
+import json
 import os
 from pathlib import Path
 import yaml
@@ -10,9 +11,16 @@ import docker
 import requests
 from redis import Redis
 from pydantic import BaseModel, Field, field_validator as pydantic_validator
-from typing import Any, Dict,  Literal, List
+from typing import Any, Dict, Literal, List, Optional
 
 from .config import Settings, ModelSpec
+from ..model_variant_registry import get_registry, VariantRegistry
+from ..backends.base import NodeCapabilities
+from ..backends.vllm_backend import VLLMBackend
+from ..backends.llama_cpp_backend import LlamaCppBackend
+from ..backends.cpu_runtime_backend import CpuRuntimeBackend
+from ..execution_selector import ExecutionSelector
+from ..vram_estimator import auto_tune_config, get_available_vram_gb
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MRM.runtime")
@@ -20,6 +28,8 @@ logger = logging.getLogger("MRM.runtime")
 
 class EnsureReq(BaseModel):
     base_model: str
+    profile: Optional[str] = None          # "quality" | "balanced" | "cheap"
+    node_capabilities: Optional[Dict[str, Any]] = None  # optional hardware override
 
 
 class StopReq(BaseModel):
@@ -63,6 +73,19 @@ def _redis_key_loras(base_model: str) -> str:
 
 def _redis_key_lora_path(base_model: str, lora_id: str) -> str:
     return f"mrm:lora_path:{base_model}:{lora_id}"
+
+
+def _redis_retry_key(base_model: str) -> str:
+    return f"mrm:retry:{base_model}"
+
+
+def _redis_config_cache_key(base_model: str) -> str:
+    return f"mrm:config_cache:{base_model}"
+
+
+def _estimate_eta(retry_step: int) -> int:
+    """Simple linear ETA heuristic: 20s base + 15s per retry step."""
+    return 20 + retry_step * 15
 
 
 class RegisterReq(BaseModel):
@@ -141,7 +164,7 @@ _ALLOWED_OVERRIDES = {
 
 class PlanFromHFReq(BaseModel):
     repo_id: str
-    preset: Literal["small_chat", "7b_awq"]
+    preset: Optional[str] = None   # formerly Literal["small_chat","7b_awq"]; now optional
     gpu: str = "0"
     overrides: Dict[str, Any] = Field(default_factory=dict)
 
@@ -155,6 +178,34 @@ class PlanFromHFReq(BaseModel):
                 "Did you accidentally pass gpu_memory_utilization?"
             )
         return v
+
+
+def _build_launch_reasoning(
+    backend_name: str,
+    variant_format: str,
+    reason: str,
+    tuning,                  # AutoTuneResult | None
+    available_vram: float,
+) -> list:
+    """Build a human-readable list of lines explaining a backend selection."""
+    lines: list = [f"GPU VRAM: {available_vram:.1f} GB available"]
+    if tuning is not None:
+        est = tuning.estimate.total_gb
+        ratio = est / available_vram if available_vram else 0
+        fit_tag = "fits" if ratio <= 0.95 else "tight fit"
+        lines.append(
+            f"Model {variant_format} estimated: {est:.1f} GB "
+            f"({ratio * 100:.0f}% of available — {fit_tag})"
+        )
+        lines.append(
+            f"Auto-tuned: max_model_len={tuning.max_model_len:,}, "
+            f"num_seqs={tuning.num_seqs}"
+        )
+    else:
+        lines.append("VRAM estimate unavailable (model_size_b not set in variant)")
+    lines.append(f"Selected backend: {backend_name}")
+    lines.append(f"Selected variant: {variant_format}  (reason: {reason})")
+    return lines
 
 
 def _slug(s: str) -> str:
@@ -176,9 +227,14 @@ def _apply_overrides_whitelist(base: Dict[str, Any], overrides: Dict[str, Any]) 
     return base
 
 
-def _build_spec_from_hf(repo_id: str, preset: str, gpu: str, overrides: Dict[str, Any]) -> ModelSpec:
-    if preset not in PRESETS:
-        raise RuntimeError409(f"Unknown preset: {preset}")
+def _build_spec_from_hf(
+    repo_id: str, preset: Optional[str], gpu: str, overrides: Dict[str, Any]
+) -> ModelSpec:
+    # None or unknown preset → fall back to small_chat defaults; overrides still apply
+    if not preset or preset not in PRESETS:
+        if preset and preset not in PRESETS:
+            raise RuntimeError409(f"Unknown preset: {preset}")
+        preset = "small_chat"
 
     p = dict(PRESETS[preset])
     p = _apply_overrides_whitelist(p, overrides or {})
@@ -215,13 +271,35 @@ def _build_spec_from_hf(repo_id: str, preset: str, gpu: str, overrides: Dict[str
 def register_from_hf(self, req: PlanFromHFReq) -> Dict[str, Any]:
     spec = _build_spec_from_hf(req.repo_id, req.preset, req.gpu, req.overrides)
     self.registry[spec.base_model] = spec
+    applied = {k: v for k, v in (req.overrides or {}).items() if k in _ALLOWED_OVERRIDES}
+    quant = spec.quantization
+    debug: Dict[str, Any] = {
+        "selected_backend": "vllm",
+        "selected_variant": "manual",
+        "quantization": quant,
+        "auto_tuned": False,
+        "max_model_len": spec.max_model_len,
+        "max_num_seqs": spec.max_num_seqs,
+        "estimated_vram_gb": None,
+        "available_vram_gb": None,
+        "reason": "manual_registration",
+        "reasoning": [
+            f"Registered from HuggingFace: {req.repo_id}",
+            f"Backend: vllm  ·  max_model_len: {spec.max_model_len:,}  ·  "
+            f"max_num_seqs: {spec.max_num_seqs}",
+            f"Quantization: {quant or 'none (fp16/auto)'}",
+            "VRAM estimate unavailable at registration time (model size not known).",
+            "VRAM will be reported after the model is started.",
+        ],
+    }
     return {
         "registered": True,
         "base_model": spec.base_model,
         "container": spec.container_name,
         "preset": req.preset,
         "gpu": req.gpu,
-        "applied_overrides": {k: v for k, v in (req.overrides or {}).items() if k in _ALLOWED_OVERRIDES},
+        "applied_overrides": applied,
+        "debug": debug,
     }
 
 
@@ -323,11 +401,20 @@ def _is_nvidia_runtime_error(exc: Exception) -> bool:
 
 
 class ModelRuntimeManager:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, variant_registry: Optional[VariantRegistry] = None):
         self.s = settings
         self.docker = docker.from_env()
         self.redis = Redis.from_url(self.s.redis_url, decode_responses=True)
         self.registry: Dict[str, ModelSpec] = self.s.load_default_registry() | (self.s.model_registry or {})
+
+        # ── Multi-backend selection layer ──────────────────────────────
+        self._variant_registry: VariantRegistry = variant_registry or get_registry()
+        self._backends = [
+            VLLMBackend(self),
+            LlamaCppBackend(self),
+            CpuRuntimeBackend(self),
+        ]
+        self._execution_selector = ExecutionSelector(self._backends, self._variant_registry)
 
     def _log_ready(self, spec: ModelSpec) -> None:
         logger.info(
@@ -335,6 +422,34 @@ class ModelRuntimeManager:
             f"model={spec.hf_model or spec.base_model} served={spec.served_model_name} "
             f"lora={'on' if spec.enable_lora else 'off'} max_loras={spec.max_loras} rank={spec.max_lora_rank} "
             f"max_len={spec.max_model_len} gpu_util={spec.gpu_memory_utilization}"
+        )
+
+    def _detect_node_capabilities(self, spec: ModelSpec) -> NodeCapabilities:
+        """Auto-detect hardware capabilities from the node running MRM."""
+        gpu_id = spec.allowed_gpus[0] if spec.allowed_gpus else "0"
+        gpu_mem = self._gpu_mem(gpu_id)
+        has_gpu = gpu_mem.get("total_mib", 0) > 0
+
+        ram_mb = 0
+        cpu_cores = 4
+        try:
+            import psutil  # type: ignore[import]
+            ram_mb = psutil.virtual_memory().total // (1024 * 1024)
+            cpu_cores = psutil.cpu_count(logical=False) or 4
+        except Exception:
+            pass
+
+        supported_backends = []
+        if has_gpu:
+            supported_backends.append("vllm")
+        supported_backends.extend(["llama.cpp", "cpu"])
+
+        return NodeCapabilities(
+            gpu=has_gpu,
+            vram_mb=gpu_mem.get("free_mib", 0),
+            ram_mb=ram_mb,
+            cpu_cores=cpu_cores,
+            supported_backends=supported_backends,
         )
 
     def lora_register(self, req: LoraRegisterReq) -> Dict[str, Any]:
@@ -493,9 +608,15 @@ class ModelRuntimeManager:
         raise RuntimeError409(f"No free GPU. All allowed GPUs {spec.allowed_gpus} are busy.")
 
     def _spec(self, base_model: str) -> ModelSpec:
-        if base_model not in self.registry:
-            raise RuntimeError409(f"Unknown base_model: {base_model}")
-        return self.registry[base_model]
+        if base_model in self.registry:
+            return self.registry[base_model]
+        # Fall back to alias/served_model_name reverse lookup so callers can
+        # use either the HuggingFace repo ID or the short alias (e.g. the name
+        # vLLM reports via /v1/models).
+        for spec in self.registry.values():
+            if spec.model_alias == base_model or spec.served_model_name == base_model:
+                return spec
+        raise RuntimeError409(f"Unknown base_model: {base_model}")
 
     def _health_url(self, spec: ModelSpec) -> str:
         return f"http://{spec.container_name}:{spec.port}{spec.health_path}"
@@ -513,6 +634,8 @@ class ModelRuntimeManager:
         self.redis.expire(k, max(self.s.idle_timeout_sec * 4, 3600))
 
     def touch(self, base_model: str) -> None:
+        spec = self._spec(base_model)
+        base_model = spec.base_model  # normalize alias → canonical registry key
         st = self._get_state(base_model)
         self._set_state(base_model, {"last_used": _now()})
         gpu = st.get("gpu")
@@ -776,9 +899,69 @@ class ModelRuntimeManager:
     # -------------------------
     # Public API
     # -------------------------
-    def ensure_running(self, base_model: str) -> Dict[str, Any]:
+    def ensure_running(
+        self,
+        base_model: str,
+        profile: Optional[str] = None,
+        node_capabilities: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         spec = self._spec(base_model)
+        base_model = spec.base_model  # normalize alias → canonical registry key
 
+        # ── Multi-backend selection path ───────────────────────────────
+        # Used when model variants are registered in the variant registry.
+        _vr = getattr(self, "_variant_registry", None)
+        if _vr is not None and _vr.has_variants(base_model):
+            if node_capabilities is not None:
+                node_caps = NodeCapabilities.from_dict(node_capabilities)
+            else:
+                node_caps = self._detect_node_capabilities(spec)
+
+            _sel = getattr(self, "_execution_selector", None)
+            result = _sel.select(base_model, node_caps, profile) if _sel else None
+            if result:
+                launched = result.backend.launch(base_model, result.variant, node_caps)
+
+                # ── Build debug / explainability metadata ──────────────
+                tuning = auto_tune_config(result.variant, node_caps)
+                available_vram = get_available_vram_gb(node_caps)
+                debug: Dict[str, Any] = {
+                    "selected_backend": result.backend.name,
+                    "selected_variant": result.variant.format,
+                    "quantization": result.variant.quantization,
+                    "auto_tuned": tuning is not None,
+                    "max_model_len": tuning.max_model_len if tuning else None,
+                    "max_num_seqs": tuning.num_seqs if tuning else None,
+                    "estimated_vram_gb": tuning.estimate.total_gb if tuning else None,
+                    "available_vram_gb": round(available_vram, 2),
+                    "reason": result.reason,
+                    "reasoning": _build_launch_reasoning(
+                        result.backend.name,
+                        result.variant.format,
+                        result.reason,
+                        tuning,
+                        available_vram,
+                    ),
+                }
+                launched["debug"] = debug
+
+                # Persist key fields to Redis so status() can surface them
+                self._set_state(base_model, {
+                    "backend": result.backend.name,
+                    "variant": result.variant.format,
+                    "debug_est_vram": str(debug["estimated_vram_gb"] or ""),
+                    "debug_avail_vram": str(debug["available_vram_gb"] or ""),
+                    "debug_max_len": str(debug["max_model_len"] or ""),
+                })
+                return launched
+            # Fall through to legacy path if selector finds nothing
+            logger.warning(
+                "ExecutionSelector found no runnable variant for %s "
+                "(profile=%s). Falling back to legacy ensure path.",
+                base_model, profile,
+            )
+
+        # ── Legacy path ────────────────────────────────────────────────
         # CPU models use a separate, simpler path — no GPU allocation needed
         if getattr(spec, "runtime", "gpu") == "cpu":
             return self._ensure_cpu(base_model, spec)
@@ -876,6 +1059,92 @@ class ModelRuntimeManager:
             "runtime_type": "cpu",
         }
 
+    # ── Learning Runtime: config cache ────────────────────────────────
+
+    def _load_config_cache(self, base_model: str) -> Optional[Dict[str, Any]]:
+        """
+        Return the cached best_config for *base_model* if it has a success
+        rate ≥ 70%.  Returns None if no cache, insufficient data, or unreliable.
+        """
+        try:
+            raw = self.redis.get(_redis_config_cache_key(base_model))
+            if not raw:
+                return None
+            data = json.loads(raw)
+            success  = int(data.get("success_count", 0))
+            failure  = int(data.get("failure_count", 0))
+            total    = success + failure
+            if total == 0:
+                return None
+            if success / total < 0.7:
+                return None
+            return data.get("best_config")
+        except Exception as exc:
+            logger.warning("Failed to read config cache for %s: %s", base_model, exc)
+            return None
+
+    def _update_config_cache_success(
+        self, base_model: str, max_model_len: int, gpu: str
+    ) -> None:
+        """Record a successful launch config; persist to Redis for 30 days."""
+        try:
+            key  = _redis_config_cache_key(base_model)
+            raw  = self.redis.get(key)
+            data = json.loads(raw) if raw else {}
+            data["best_config"]    = {"max_model_len": max_model_len, "gpu": gpu}
+            data["success_count"]  = int(data.get("success_count", 0)) + 1
+            self.redis.set(key, json.dumps(data), ex=86400 * 30)
+            logger.info(
+                '{"event":"config_cached","model":"%s","max_model_len":%d,'
+                '"success_count":%d}',
+                base_model, max_model_len, data["success_count"],
+            )
+        except Exception as exc:
+            logger.warning("Failed to update config cache for %s: %s", base_model, exc)
+
+    def _update_config_cache_failure(self, base_model: str) -> None:
+        """Increment failure count in the config cache."""
+        try:
+            key  = _redis_config_cache_key(base_model)
+            raw  = self.redis.get(key)
+            data = json.loads(raw) if raw else {}
+            data["failure_count"] = int(data.get("failure_count", 0)) + 1
+            self.redis.set(key, json.dumps(data), ex=86400 * 30)
+        except Exception as exc:
+            logger.warning("Failed to update failure count for %s: %s", base_model, exc)
+
+    # ── WARMING state: retry context ──────────────────────────────────
+
+    def _set_retry_context(
+        self, base_model: str, retry_step: int, max_model_len: int
+    ) -> None:
+        """Persist retry metadata so status() can expose ETA and step number."""
+        try:
+            self.redis.set(
+                _redis_retry_key(base_model),
+                json.dumps({
+                    "retry_step":    retry_step,
+                    "max_model_len": max_model_len,
+                    "started_at":    _now(),
+                }),
+                ex=3600,
+            )
+            logger.info(
+                '{"event":"model_warming","model":"%s","retry_step":%d,"max_model_len":%d}',
+                base_model, retry_step, max_model_len,
+            )
+        except Exception as exc:
+            logger.warning("Failed to set retry context for %s: %s", base_model, exc)
+
+    def _clear_retry_context(self, base_model: str) -> None:
+        """Remove retry metadata after success or terminal failure."""
+        try:
+            self.redis.delete(_redis_retry_key(base_model))
+        except Exception:
+            pass
+
+    # ── GPU ensure ────────────────────────────────────────────────────
+
     def _ensure_gpu(self, base_model: str, spec: ModelSpec) -> Dict[str, Any]:
         """Original GPU (vLLM) ensure logic — unchanged."""
         if not self._acquire_lock(base_model):
@@ -928,17 +1197,39 @@ class ModelRuntimeManager:
                 }
 
             # Fresh start
+            # ── Learning Runtime: start from cached best config if reliable ──
+            full_ladder = self._max_len_ladder(spec)
+            cached = self._load_config_cache(base_model)
+            if cached and cached.get("max_model_len"):
+                cached_len = int(cached["max_model_len"])
+                if cached_len in full_ladder:
+                    ladder = full_ladder[full_ladder.index(cached_len):]
+                    logger.info(
+                        "Config cache hit for %s: starting at max_model_len=%d",
+                        base_model, cached_len,
+                    )
+                else:
+                    ladder = full_ladder
+            else:
+                ladder = full_ladder
+
             self._set_state(base_model, {"state": "STARTING", "last_used": _now()})
             gpu = self._choose_gpu(spec)
             self._gpu_reserve(gpu, base_model)
             gpu_reserved = True
 
-            ladder = self._max_len_ladder(spec)
             last_exc = None
 
-            for L in ladder:
+            for retry_step, L in enumerate(ladder):
                 spec.max_model_len = L
-                self._set_state(base_model, {"trying_max_model_len": L})
+
+                # Transition to WARMING on retry steps to distinguish
+                # "first attempt" from "fallback attempt" in the UI / status API.
+                if retry_step == 0:
+                    self._set_state(base_model, {"trying_max_model_len": L})
+                else:
+                    self._set_state(base_model, {"state": "WARMING", "trying_max_model_len": L})
+                    self._set_retry_context(base_model, retry_step, L)
 
                 self._container_remove_if_exists(spec.container_name)
 
@@ -948,15 +1239,19 @@ class ModelRuntimeManager:
                     self._wait_ready(spec)
                     self._log_ready(spec)
                     self._set_state(base_model, {"best_max_model_len": L})
+                    self._clear_retry_context(base_model)
+                    self._update_config_cache_success(base_model, L, gpu)
                     last_exc = None
                     break
                 except Exception as e:
                     last_exc = e
                     logger.error("Attempt failed for max_model_len=%s: %s", L, e)
+                    self._update_config_cache_failure(base_model)
                     self._container_remove_if_exists(spec.container_name)
                     time.sleep(1)
 
             if last_exc is not None:
+                self._clear_retry_context(base_model)
                 raise last_exc
 
             self._set_state(base_model, {"state": "READY", "last_used": _now(), "gpu": gpu})
@@ -992,8 +1287,17 @@ class ModelRuntimeManager:
 
     def stop(self, base_model: str) -> Dict[str, Any]:
         spec = self._spec(base_model)
+        base_model = spec.base_model  # normalize alias → canonical registry key
         if not self._acquire_lock(base_model):
-            raise RuntimeError409("Model locked")
+            # Allow stop to proceed on a FAILED model — the lock may be stale
+            # from an ensure() that never completed (e.g. container OOM crash).
+            st = self._get_state(base_model)
+            if st.get("state") != "FAILED":
+                raise RuntimeError409("Model locked")
+            logger.warning("stop: force-clearing stale lock for FAILED model %s", base_model)
+            self._release_lock(base_model)
+            if not self._acquire_lock(base_model):
+                raise RuntimeError409("Model locked")
 
         try:
             st = self._get_state(base_model)
@@ -1016,8 +1320,16 @@ class ModelRuntimeManager:
 
     def remove(self, base_model: str) -> Dict[str, Any]:
         spec = self._spec(base_model)
+        base_model = spec.base_model  # normalize alias → canonical registry key
         if not self._acquire_lock(base_model):
-            raise RuntimeError409("Model locked")
+            # Allow remove on a FAILED model — stale lock from crashed ensure().
+            st = self._get_state(base_model)
+            if st.get("state") != "FAILED":
+                raise RuntimeError409("Model locked")
+            logger.warning("remove: force-clearing stale lock for FAILED model %s", base_model)
+            self._release_lock(base_model)
+            if not self._acquire_lock(base_model):
+                raise RuntimeError409("Model locked")
 
         try:
             st = self._get_state(base_model)
@@ -1032,13 +1344,14 @@ class ModelRuntimeManager:
 
     def status(self, base_model: str) -> Dict[str, Any]:
         spec = self._spec(base_model)
+        base_model = spec.base_model  # normalize alias → canonical registry key
         st = self._get_state(base_model)
         c = self._container_get(spec.container_name)
         running = bool(c and self._container_is_running(c))
         state = st.get("state", "ABSENT")
         if running and state != "READY":
             state = "READY"
-        if (not running) and state not in ("ABSENT", "STOPPING", "STARTING", "STOPPED"):
+        if (not running) and state not in ("ABSENT", "STOPPING", "STARTING", "STOPPED", "WARMING"):
             state = "STOPPED" if c else "ABSENT"
 
         active_loras = []
@@ -1050,6 +1363,27 @@ class ModelRuntimeManager:
         except Exception as e:
             logger.error(f"Failed to read active loras: {e}")
 
+        # ── Optional debug/explainability fields (set during ensure_running) ──
+        backend  = st.get("backend", "")
+        variant  = st.get("variant", "")
+        debug: Optional[Dict[str, Any]] = None
+        if backend:
+            def _maybe_float(v: str) -> Optional[float]:
+                try: return float(v) if v else None
+                except (ValueError, TypeError): return None
+
+            def _maybe_int(v: str) -> Optional[int]:
+                try: return int(v) if v else None
+                except (ValueError, TypeError): return None
+
+            debug = {
+                "selected_backend": backend,
+                "selected_variant": variant,
+                "estimated_vram_gb": _maybe_float(st.get("debug_est_vram", "")),
+                "available_vram_gb": _maybe_float(st.get("debug_avail_vram", "")),
+                "max_model_len":     _maybe_int(st.get("debug_max_len", "")),
+            }
+
         out = {
             "base_model": base_model,
             "model_alias": spec.model_alias,
@@ -1059,10 +1393,34 @@ class ModelRuntimeManager:
             "running": running,
             "gpu": st.get("gpu", ""),
             "last_used": st.get("last_used", ""),
-            "active_loras": active_loras,          # <--- ТЕПЕР МИ БАЧИМО ПРАВДУ
-            "active_loras_count": len(active_loras)
+            "active_loras": active_loras,
+            "active_loras_count": len(active_loras),
+            # Optional — present only when backend selection was performed
+            "backend": backend,
+            "model_variant": variant,
         }
-        self._set_state(base_model, {"state": state})
+        if debug:
+            out["debug"] = debug
+
+        # Retry / WARMING metadata — read from mrm:retry:{model}
+        retry_info = None
+        try:
+            retry_raw = self.redis.get(_redis_retry_key(base_model))
+            if retry_raw:
+                retry_info = json.loads(retry_raw)
+        except Exception:
+            pass
+        if retry_info:
+            retry_step = int(retry_info.get("retry_step", 0))
+            out.update({
+                "retry_step": retry_step,
+                "max_model_len": int(retry_info.get("max_model_len", 0)) or None,
+                "eta_sec": _estimate_eta(retry_step),
+            })
+
+        # Only write back state if we actually normalised it (don't clobber WARMING)
+        if state not in ("WARMING",):
+            self._set_state(base_model, {"state": state})
         return out
 
     def status_all(self) -> List[Dict[str, Any]]:
@@ -1073,6 +1431,10 @@ class ModelRuntimeManager:
         now = _now()
         for bm, spec in self.registry.items():
             st = self._get_state(bm)
+            state = st.get("state", "ABSENT")
+            # Never evict models that are mid-launch or OOM-retrying
+            if state in ("STARTING", "WARMING"):
+                continue
             last_used = int(st.get("last_used") or "0")
             if last_used == 0:
                 continue

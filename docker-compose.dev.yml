@@ -77,7 +77,7 @@ services:
     build: ./model_runtime_manager
     runtime: nvidia
     container_name: dev_mrm
-    command: uvicorn mrm.app:app --host 0.0.0.0 --port 8010
+    command: uvicorn model_runtime_manager.mrm.app:app --host 0.0.0.0 --port 8010
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
       interval: 10s
@@ -89,7 +89,11 @@ services:
       - ./artifacts:/artifacts
       - ./hf_cache:/app_host/hf_cache
       - ./shared:/shared
+      # Source mount — makes model_runtime_manager importable without rebuilding the image.
+      # Combined with PYTHONPATH=/app, the package is found at /app/model_runtime_manager/.
+      - ./model_runtime_manager:/app/model_runtime_manager
     environment:
+      PYTHONPATH: /app
       MRM_REDIS_URL: redis://redis:6379/2
       MRM_DOCKER_NETWORK: ai_net
       MRM_IDLE_TIMEOUT_SEC: "900"
@@ -318,7 +322,7 @@ services:
   frontend:
     build: ./frontend
     container_name: dev_frontend
-    command: streamlit run ui/app_2.py --server.port=8502 --server.address=0.0.0.0 --server.baseUrlPath=/ui
+    command: streamlit run ui/app.py --server.port=8502 --server.address=0.0.0.0 --server.baseUrlPath=/ui
     ports:
       - "8502:8502"
     environment:

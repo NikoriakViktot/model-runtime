@@ -82,7 +82,7 @@ def render():
             prompt_names = list(prompts.keys())
 
             with st.container():
-                mode = st.radio("", ["New prompt", "Edit existing"],
+                mode = st.radio("Mode", ["New prompt", "Edit existing"],
                                 horizontal=True, label_visibility="collapsed")
 
             if mode == "Edit existing" and prompt_names:

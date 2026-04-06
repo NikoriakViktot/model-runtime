@@ -48,7 +48,8 @@ class MRMClient(BaseClient):
     def hf_recommend(self, q: str, gpu_id: str = "0", limit: int = 20) -> APIResult:
         return self._get("/hf/recommend", params={"q": q, "gpu_id": gpu_id, "limit": limit}, timeout=20)
 
-    def register_from_hf(self, repo_id: str, preset: str, gpu: str = "0",
+    def register_from_hf(self, repo_id: str, gpu: str = "0",
+                         preset: str | None = None,
                          overrides: dict | None = None) -> APIResult:
         return self._post("/models/register_from_hf", body={
             "repo_id": repo_id, "preset": preset,

@@ -8,6 +8,7 @@ from ui.services.mrm_client import mrm
 from ui.components.tables import model_status_table
 from ui.components.json_viewer import json_viewer
 from ui.components.metrics import api_result_header
+from ui.components.runtime_explain import runtime_summary_line, render_runtime_debug
 from ui.utils.formatters import runtime_badge, fmt_ts
 
 
@@ -82,6 +83,13 @@ def render():
                 st.caption(f"API base: `{m.get('api_base', '—')}`")
                 if loras:
                     st.caption("LoRAs: " + ", ".join(f"`{l}`" for l in loras))
+
+                # Runtime summary (shown when backend selection metadata is available)
+                summary = runtime_summary_line(m)
+                if summary:
+                    st.caption(summary)
+                    with st.expander("🔍 Runtime Selection Debug", expanded=False):
+                        render_runtime_debug(m.get("debug"))
 
             with c2:
                 if not running:
